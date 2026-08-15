@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>SyntaxCircus.Blazor.Auth</PackageId>
+    <Title>SyntaxCircus Blazor Auth</Title>
+    <Description>OIDC token forwarding, refresh, caching (with optional Redis backing for multi-instance deployments), and a client-credentials fallback for interactive Blazor Server applications.</Description>
+    <Authors>SyntaxCircus</Authors>
+    <Company>SyntaxCircus</Company>
+    <Copyright>Copyright © SyntaxCircus</Copyright>
+    <PackageTags>blazor;authentication;oidc;token-forwarding</PackageTags>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/Syntax-Circus/SyntaxCircus.Blazor.Auth</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Syntax-Circus/SyntaxCircus.Blazor.Auth</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" />
+    <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" />
+    <PackageReference Include="GitVersion.MsBuild" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>

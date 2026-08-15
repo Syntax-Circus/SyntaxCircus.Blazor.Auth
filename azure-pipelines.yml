@@ -1,0 +1,17 @@
+trigger:
+  branches:
+    include: ["*"]
+pr:
+  branches:
+    include: ["*"]
+pool:
+  vmImage: ubuntu-latest
+steps:
+  - task: UseDotNet@2
+    inputs:
+      packageType: sdk
+      version: 10.0.x
+  - script: dotnet restore SyntaxCircus.Blazor.Auth.slnx
+    displayName: Restore
+  - script: dotnet build SyntaxCircus.Blazor.Auth.slnx --no-restore --configuration Release
+    displayName: Build

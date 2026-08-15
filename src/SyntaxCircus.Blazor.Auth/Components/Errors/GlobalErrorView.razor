@@ -1,0 +1,55 @@
+@namespace SyntaxCircus.Blazor.Auth.Components.Errors
+
+<div class="container py-5" data-global-error-boundary>
+    <div class="alert alert-danger shadow-sm mb-0" role="alert">
+        <h1 class="h4 mb-3">@Title</h1>
+        <p class="mb-0">@Description</p>
+
+#if DEBUG
+        @if (Exception is not null)
+        {
+            <hr />
+            <div class="small">
+                <strong>Debug:</strong> @Exception.Message
+            </div>
+        }
+#endif
+
+        <div class="d-flex flex-wrap gap-2 mt-4">
+            <button type="button" class="btn btn-primary" @onclick="OnRetry">
+                @RetryLabel
+            </button>
+
+            @if (!string.IsNullOrWhiteSpace(HomeHref))
+            {
+                <a class="btn btn-outline-secondary" href="@HomeHref">@HomeLabel</a>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    [Parameter]
+    public string AppName { get; set; } = "the application";
+
+    [Parameter]
+    public string Title { get; set; } = "We hit an unexpected snag.";
+
+    [Parameter]
+    public string Description { get; set; } = "Something went wrong rendering this screen. Try again to recover without reloading.";
+
+    [Parameter]
+    public string RetryLabel { get; set; } = "Try again";
+
+    [Parameter]
+    public string? HomeHref { get; set; } = "/";
+
+    [Parameter]
+    public string HomeLabel { get; set; } = "Go home";
+
+    [Parameter]
+    public Exception? Exception { get; set; }
+
+    [Parameter]
+    public EventCallback OnRetry { get; set; }
+}

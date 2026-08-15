@@ -1,0 +1,19 @@
+@namespace SyntaxCircus.Blazor.Auth.Components.Errors
+
+<LoggingErrorBoundary @ref="_errorBoundary" BoundaryName="@BoundaryName">
+    <ChildContent>
+        <div @key="_renderVersion">
+            @ChildContent
+        </div>
+    </ChildContent>
+    <ErrorContent Context="exception">
+        <GlobalErrorView AppName="@AppName"
+                         Title="@Title"
+                         Description="@Description"
+                         RetryLabel="@RetryLabel"
+                         HomeHref="@HomeHref"
+                         HomeLabel="@HomeLabel"
+                         Exception="exception"
+                         OnRetry="RecoverAsync" />
+    </ErrorContent>
+</LoggingErrorBoundary>
