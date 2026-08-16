@@ -1,6 +1,7 @@
 # SyntaxCircus.Blazor.Auth
 
 [![Build](https://github.com/Syntax-Circus/SyntaxCircus.Blazor.Auth/actions/workflows/build.yml/badge.svg)](https://github.com/Syntax-Circus/SyntaxCircus.Blazor.Auth/actions/workflows/build.yml)
+[![NuGet](https://img.shields.io/nuget/v/SyntaxCircus.Blazor.Auth.svg)](https://www.nuget.org/packages/SyntaxCircus.Blazor.Auth)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.txt)
 
 Server-side OIDC token forwarding, refresh, and resilience for interactive Blazor Server applications. The tokens issued at cookie/OIDC sign-in are cached, refreshed, and attached to outgoing calls to your backend API — on the initial HTTP request and later inside the SignalR circuit, where there's no `HttpContext` to read the auth cookie from.

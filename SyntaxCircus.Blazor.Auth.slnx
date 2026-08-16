@@ -1,3 +1,17 @@
 <Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".editorconfig" />
+    <File Path=".github/workflows/build.yml" />
+    <File Path=".gitignore" />
+    <File Path="azure-pipelines.yml" />
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Packages.props" />
+    <File Path="GitVersion.yml" />
+    <File Path="global.json" />
+    <File Path="LICENSE.txt" />
+    <File Path="publish.ps1" />
+    <File Path="README.md" />
+  </Folder>
   <Project Path="src/SyntaxCircus.Blazor.Auth/SyntaxCircus.Blazor.Auth.csproj" />
+  <Project Path="tests/SyntaxCircus.Blazor.Auth.Tests/SyntaxCircus.Blazor.Auth.Tests.csproj" />
 </Solution>
