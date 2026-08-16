@@ -16,6 +16,8 @@ public class AuthOptionsTests
         options.TokenCache.Redis.Enabled.ShouldBeFalse();
         options.TokenCache.Redis.ConnectionString.ShouldBe(string.Empty);
         options.TokenCache.Redis.InstanceName.ShouldBe("SyntaxCircus:OidcTokenCache:");
+        options.TokenCache.Redis.Protection.Enabled.ShouldBeFalse();
+        options.TokenCache.Redis.Protection.Purpose.ShouldBe("SyntaxCircus.Blazor.Auth.RedisServerTokenCache");
     }
 
     [Fact]

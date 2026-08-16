@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.DataProtection;
 
 namespace SyntaxCircus.Blazor.Auth.Tests;
 
@@ -18,6 +19,23 @@ public class RedisServerTokenCacheTests
             },
         });
         return (new RedisServerTokenCache(distributedCache, options), distributedCache);
+    }
+
+    private static (RedisServerTokenCache Cache, IDistributedCache DistributedCache) CreateProtectedCache()
+    {
+        var distributedCache = Substitute.For<IDistributedCache>();
+        var options = Options.Create(new AuthOptions
+        {
+            TokenCache = new AuthOptions.TokenCacheOptions
+            {
+                Redis = new AuthOptions.RedisTokenCacheOptions
+                {
+                    InstanceName = InstanceName,
+                    Protection = new AuthOptions.RedisTokenCacheProtectionOptions { Enabled = true },
+                },
+            },
+        });
+        return (new RedisServerTokenCache(distributedCache, options, new EphemeralDataProtectionProvider()), distributedCache);
     }
 
     private static JsonSerializerOptions JsonOptions { get; } = new(JsonSerializerDefaults.Web);
@@ -165,5 +183,80 @@ public class RedisServerTokenCacheTests
 
         await Should.ThrowAsync<ArgumentNullException>(() =>
             cache.WithRefreshLockAsync<string>("user:1", null!, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task SetAsync_ProtectedMode_StoresNonPlaintextPayload()
+    {
+        var (cache, distributedCache) = CreateProtectedCache();
+        var entry = new ServerTokenCacheEntry("access-token-value", "refresh", "id", DateTimeOffset.UtcNow.AddMinutes(10));
+        byte[]? capturedPayload = null;
+        await distributedCache.SetAsync(
+            Arg.Any<string>(),
+            Arg.Do<byte[]>(b => capturedPayload = b),
+            Arg.Any<DistributedCacheEntryOptions>(),
+            Arg.Any<CancellationToken>());
+
+        await cache.SetAsync("user:1", entry, TestContext.Current.CancellationToken);
+
+        capturedPayload.ShouldNotBeNull();
+        var storedText = Encoding.UTF8.GetString(capturedPayload);
+        storedText.ShouldNotContain("access-token-value");
+        Should.Throw<JsonException>(() => JsonSerializer.Deserialize<ServerTokenCacheEntry>(storedText, JsonOptions));
+    }
+
+    [Fact]
+    public async Task GetAsync_ProtectedMode_RoundTripsStoredEntry()
+    {
+        var (cache, distributedCache) = CreateProtectedCache();
+        var entry = new ServerTokenCacheEntry("access", "refresh", "id", DateTimeOffset.UtcNow.AddMinutes(10));
+        byte[]? capturedPayload = null;
+        await distributedCache.SetAsync(
+            Arg.Any<string>(),
+            Arg.Do<byte[]>(b => capturedPayload = b),
+            Arg.Any<DistributedCacheEntryOptions>(),
+            Arg.Any<CancellationToken>());
+        await cache.SetAsync("user:1", entry, TestContext.Current.CancellationToken);
+        distributedCache.GetAsync(Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns(capturedPayload);
+
+        var result = await cache.GetAsync("user:1", TestContext.Current.CancellationToken);
+
+        result.ShouldBe(entry);
+    }
+
+    [Fact]
+    public async Task GetAsync_ProtectedMode_UndecryptablePayload_RemovesEntryAndReturnsNull()
+    {
+        var (cache, distributedCache) = CreateProtectedCache();
+        distributedCache.GetAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Encoding.UTF8.GetBytes("not-a-protected-payload"));
+
+        var result = await cache.GetAsync("user:1", TestContext.Current.CancellationToken);
+
+        result.ShouldBeNull();
+        await distributedCache.Received(1).RemoveAsync($"{InstanceName}user:1", Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task GetAsync_ProtectionEnabledWithoutProvider_ThrowsInvalidOperationException()
+    {
+        var distributedCache = Substitute.For<IDistributedCache>();
+        var options = Options.Create(new AuthOptions
+        {
+            TokenCache = new AuthOptions.TokenCacheOptions
+            {
+                Redis = new AuthOptions.RedisTokenCacheOptions
+                {
+                    InstanceName = InstanceName,
+                    Protection = new AuthOptions.RedisTokenCacheProtectionOptions { Enabled = true },
+                },
+            },
+        });
+        var cache = new RedisServerTokenCache(distributedCache, options);
+        distributedCache.GetAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Encoding.UTF8.GetBytes("payload"));
+
+        await Should.ThrowAsync<InvalidOperationException>(() =>
+            cache.GetAsync("user:1", TestContext.Current.CancellationToken));
     }
 }
