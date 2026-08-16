@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text.Json;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Options;
 
@@ -11,15 +13,36 @@ namespace SyntaxCircus.Blazor.Auth;
 /// <c>Authentication:Oidc:TokenCache:Redis:Enabled</c> is set — see
 /// <see cref="BlazorTokenForwardingExtensions.AddBlazorTokenForwarding"/>. Refresh locks stay
 /// in-process; a brief cross-instance race producing two refresh attempts is harmless since the
-/// latest token simply wins.
+/// latest token simply wins. When <c>Authentication:Oidc:TokenCache:Redis:Protection:Enabled</c> is
+/// set, <paramref name="dataProtectionProvider"/> is used to encrypt payloads at rest.
 /// </summary>
 public sealed class RedisServerTokenCache(
     IDistributedCache cache,
-    IOptions<AuthOptions> options) : IServerTokenCache
+    IOptions<AuthOptions> options,
+    IDataProtectionProvider? dataProtectionProvider = null) : IServerTokenCache
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _refreshLocks = new(StringComparer.Ordinal);
+
+    private readonly Lazy<IDataProtector?> _protector = new(() =>
+    {
+        var protection = options.Value.TokenCache.Redis.Protection;
+        if (!protection.Enabled)
+        {
+            return null;
+        }
+
+        if (dataProtectionProvider is null)
+        {
+            throw new InvalidOperationException(
+                "Authentication:Oidc:TokenCache:Redis:Protection:Enabled is set but no IDataProtectionProvider " +
+                "was supplied to RedisServerTokenCache. Register the cache via AddBlazorTokenForwarding, which " +
+                "wires this up automatically, or pass a provider explicitly.");
+        }
+
+        return dataProtectionProvider.CreateProtector(protection.Purpose);
+    });
 
     public async Task<ServerTokenCacheEntry?> GetAsync(string cacheKey, CancellationToken cancellationToken = default)
     {
@@ -44,6 +67,11 @@ public sealed class RedisServerTokenCache(
         }
 
         var payload = JsonSerializer.Serialize(entry, JsonOptions);
+        if (_protector.Value is { } protector)
+        {
+            payload = protector.Protect(payload);
+        }
+
         var ttl = entry.ExpiresAtUtc - DateTimeOffset.UtcNow + TimeSpan.FromDays(30);
         if (ttl <= TimeSpan.Zero)
         {
@@ -86,6 +114,19 @@ public sealed class RedisServerTokenCache(
         if (string.IsNullOrWhiteSpace(payload))
         {
             return null;
+        }
+
+        if (_protector.Value is { } protector)
+        {
+            try
+            {
+                payload = protector.Unprotect(payload);
+            }
+            catch (CryptographicException)
+            {
+                await cache.RemoveAsync(key, cancellationToken).ConfigureAwait(false);
+                return null;
+            }
         }
 
         try

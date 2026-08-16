@@ -30,5 +30,14 @@ public sealed class AuthOptions
         public string ConnectionString { get; set; } = string.Empty;
 
         public string InstanceName { get; set; } = "SyntaxCircus:OidcTokenCache:";
+
+        public RedisTokenCacheProtectionOptions Protection { get; set; } = new();
+    }
+
+    public sealed class RedisTokenCacheProtectionOptions
+    {
+        public bool Enabled { get; set; }
+
+        public string Purpose { get; set; } = "SyntaxCircus.Blazor.Auth.RedisServerTokenCache";
     }
 }

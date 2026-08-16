@@ -49,6 +49,24 @@ public class BlazorTokenForwardingExtensionsTests
     }
 
     [Fact]
+    public void AddBlazorTokenForwarding_RedisAndProtectionEnabled_RegistersRedisTokenCacheWithoutConnecting()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddScoped(_ => Substitute.For<AuthenticationStateProvider>());
+        services.AddBlazorTokenForwarding(BuildConfiguration(new Dictionary<string, string?>
+        {
+            ["Authentication:Oidc:TokenCache:Redis:Enabled"] = "true",
+            ["Authentication:Oidc:TokenCache:Redis:ConnectionString"] = "localhost:6379",
+            ["Authentication:Oidc:TokenCache:Redis:Protection:Enabled"] = "true",
+        }));
+
+        using var provider = services.BuildServiceProvider();
+
+        provider.GetRequiredService<IServerTokenCache>().ShouldBeOfType<RedisServerTokenCache>();
+    }
+
+    [Fact]
     public void AddBlazorTokenForwarding_RedisEnabledButNoConnectionString_FallsBackToInProcessCache()
     {
         var services = new ServiceCollection();

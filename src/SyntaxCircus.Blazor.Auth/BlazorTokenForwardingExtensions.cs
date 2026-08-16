@@ -1,3 +1,7 @@
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Extensions.Caching.Distributed;
+using StackExchange.Redis;
+
 namespace SyntaxCircus.Blazor.Auth;
 
 public static class BlazorTokenForwardingExtensions
@@ -35,7 +39,15 @@ public static class BlazorTokenForwardingExtensions
                 cacheOptions.Configuration = redisOptions.ConnectionString;
                 cacheOptions.InstanceName = redisOptions.InstanceName;
             });
-            services.AddSingleton<IServerTokenCache, RedisServerTokenCache>();
+
+            var protectionProvider = redisOptions.Protection.Enabled
+                ? BuildRedisProtectionProvider(redisOptions)
+                : null;
+
+            services.AddSingleton<IServerTokenCache>(sp => new RedisServerTokenCache(
+                sp.GetRequiredService<IDistributedCache>(),
+                sp.GetRequiredService<IOptions<AuthOptions>>(),
+                protectionProvider));
         }
         else
         {
@@ -43,6 +55,28 @@ public static class BlazorTokenForwardingExtensions
         }
 
         return services;
+    }
+
+    /// <summary>
+    /// Builds a standalone <see cref="IDataProtectionProvider"/> whose key ring is persisted to the
+    /// same Redis instance as the token cache, isolated from the host application's own
+    /// <c>AddDataProtection()</c> setup (so it never affects cookies, antiforgery, or anything else
+    /// the host app protects). The Redis connection is opened lazily, on first key-ring access —
+    /// not eagerly here — to match the lazy-connect behavior of <see cref="StackExchangeRedisCacheServiceCollectionExtensions.AddStackExchangeRedisCache"/>.
+    /// </summary>
+    private static IDataProtectionProvider BuildRedisProtectionProvider(AuthOptions.RedisTokenCacheOptions redisOptions)
+    {
+        var lazyMultiplexer = new Lazy<IConnectionMultiplexer>(() => ConnectionMultiplexer.Connect(redisOptions.ConnectionString));
+
+        var protectionServices = new ServiceCollection();
+        protectionServices
+            .AddDataProtection()
+            .SetApplicationName("SyntaxCircus.Blazor.Auth.RedisServerTokenCache")
+            .PersistKeysToStackExchangeRedis(
+                () => lazyMultiplexer.Value.GetDatabase(),
+                $"{redisOptions.InstanceName}DataProtection-Keys");
+
+        return protectionServices.BuildServiceProvider().GetRequiredService<IDataProtectionProvider>();
     }
 
     /// <summary>
