@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 
@@ -86,7 +87,7 @@ public sealed class ServerRequestOidcTokenResolver(
 
         return await tokenCache.WithRefreshLockAsync(
             cacheKey,
-            async lockCt => await RefreshNearExpiryTokenAsync(
+            async lockCt => await ResolveNearExpiryTokenAsync(
                 httpContext,
                 authenticateResult,
                 cacheKey,
@@ -96,6 +97,48 @@ public sealed class ServerRequestOidcTokenResolver(
                 expiresAt,
                 lockCt).ConfigureAwait(false),
             cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs inside the per-cache-key refresh lock. Detects the case where a SignalR-circuit-path
+    /// refresh (<see cref="ApiAuthHandler.TryRefreshInCircuitAsync"/>) already rotated the refresh
+    /// token in <see cref="IServerTokenCache"/> with no HttpContext available to persist it back to
+    /// the cookie — the stale cookie's refresh token may already be rejected by an OIDC provider
+    /// that rotates refresh tokens on use. When the cache's refresh token differs from the cookie's,
+    /// prefer the cache: reuse its access token directly if still usable, or fall back to refreshing
+    /// with the cache's (fresher) refresh token instead of the cookie's.
+    /// </summary>
+    private async Task<ServerRequestOidcTokenResolution> ResolveNearExpiryTokenAsync(
+        HttpContext httpContext,
+        AuthenticateResult authenticateResult,
+        string cacheKey,
+        string? subject,
+        string cookieRefreshToken,
+        string currentAccessToken,
+        DateTimeOffset currentExpiry,
+        CancellationToken cancellationToken)
+    {
+        var cachedRefreshToken = await tokenCache.GetRefreshTokenAsync(cacheKey, cancellationToken).ConfigureAwait(false);
+        var refreshTokenDiverged = !string.IsNullOrWhiteSpace(cachedRefreshToken)
+            && !string.Equals(cachedRefreshToken, cookieRefreshToken, StringComparison.Ordinal);
+
+        if (!refreshTokenDiverged)
+        {
+            return await RefreshNearExpiryTokenAsync(
+                httpContext, authenticateResult, cacheKey, subject, cookieRefreshToken, currentAccessToken, currentExpiry, cancellationToken).ConfigureAwait(false);
+        }
+
+        var cachedEntry = await tokenCache.GetAsync(cacheKey, cancellationToken).ConfigureAwait(false);
+        if (cachedEntry is not null)
+        {
+            await PersistRefreshedTokensAsync(httpContext, authenticateResult, cachedEntry).ConfigureAwait(false);
+            return new ServerRequestOidcTokenResolution(cachedEntry.AccessToken, subject, cacheKey, false);
+        }
+
+        // The cache's own access token has also expired, but its refresh token is fresher than the
+        // cookie's — refresh with that instead of retrying the cookie's already-invalid one.
+        return await RefreshNearExpiryTokenAsync(
+            httpContext, authenticateResult, cacheKey, subject, cachedRefreshToken!, currentAccessToken, currentExpiry, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<ServerRequestOidcTokenResolution> RefreshNearExpiryTokenAsync(
@@ -147,7 +190,30 @@ public sealed class ServerRequestOidcTokenResolver(
         return string.IsNullOrWhiteSpace(contextValue) ? null : contextValue.Trim();
     }
 
-    private static async Task PersistRefreshedTokensAsync(HttpContext httpContext, AuthenticateResult authenticateResult, OidcTokenRefreshResult refreshed)
+    private static Task PersistRefreshedTokensAsync(HttpContext httpContext, AuthenticateResult authenticateResult, OidcTokenRefreshResult refreshed)
+        => PersistTokensAsync(httpContext, authenticateResult, refreshed.AccessToken, refreshed.RefreshToken, refreshed.IdToken, refreshed.ExpiresAtTokenValue);
+
+    /// <summary>
+    /// Re-signs the cookie from a <see cref="IServerTokenCache"/> entry that's ahead of what the
+    /// cookie currently holds (see <see cref="ResolveNearExpiryTokenAsync"/>), rather than from a
+    /// freshly-issued <see cref="OidcTokenRefreshResult"/>.
+    /// </summary>
+    private static Task PersistRefreshedTokensAsync(HttpContext httpContext, AuthenticateResult authenticateResult, ServerTokenCacheEntry entry)
+        => PersistTokensAsync(
+            httpContext,
+            authenticateResult,
+            entry.AccessToken,
+            entry.RefreshToken,
+            entry.IdToken,
+            entry.ExpiresAtUtc.UtcDateTime.ToString("o", CultureInfo.InvariantCulture));
+
+    private static async Task PersistTokensAsync(
+        HttpContext httpContext,
+        AuthenticateResult authenticateResult,
+        string accessToken,
+        string? refreshToken,
+        string? idToken,
+        string expiresAtTokenValue)
     {
         if (!authenticateResult.Succeeded
             || authenticateResult.Principal is null
@@ -158,12 +224,16 @@ public sealed class ServerRequestOidcTokenResolver(
         }
 
         var properties = authenticateResult.Properties;
-        properties.UpdateTokenValue("access_token", refreshed.AccessToken);
-        properties.UpdateTokenValue("refresh_token", refreshed.RefreshToken);
-        properties.UpdateTokenValue("expires_at", refreshed.ExpiresAtTokenValue);
-        if (!string.IsNullOrWhiteSpace(refreshed.IdToken))
+        properties.UpdateTokenValue("access_token", accessToken);
+        if (!string.IsNullOrWhiteSpace(refreshToken))
         {
-            properties.UpdateTokenValue("id_token", refreshed.IdToken);
+            properties.UpdateTokenValue("refresh_token", refreshToken);
+        }
+
+        properties.UpdateTokenValue("expires_at", expiresAtTokenValue);
+        if (!string.IsNullOrWhiteSpace(idToken))
+        {
+            properties.UpdateTokenValue("id_token", idToken);
         }
 
         await httpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, authenticateResult.Principal, properties).ConfigureAwait(false);
