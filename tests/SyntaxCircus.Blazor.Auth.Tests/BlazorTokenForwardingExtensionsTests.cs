@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Caching.Memory;
+
 namespace SyntaxCircus.Blazor.Auth.Tests;
 
 public class BlazorTokenForwardingExtensionsTests
@@ -29,6 +31,7 @@ public class BlazorTokenForwardingExtensionsTests
         using var provider = services.BuildServiceProvider();
 
         provider.GetRequiredService<IServerTokenCache>().ShouldBeOfType<ServerTokenCache>();
+        provider.GetRequiredService<IDistributedCache>().ShouldBeOfType<MemoryDistributedCache>();
     }
 
     [Fact]
@@ -46,6 +49,8 @@ public class BlazorTokenForwardingExtensionsTests
         using var provider = services.BuildServiceProvider();
 
         provider.GetRequiredService<IServerTokenCache>().ShouldBeOfType<RedisServerTokenCache>();
+        provider.GetRequiredService<IDistributedCache>().GetType().FullName.ShouldBe(
+            "Microsoft.Extensions.Caching.StackExchangeRedis.RedisCacheImpl");
     }
 
     [Fact]
@@ -79,6 +84,25 @@ public class BlazorTokenForwardingExtensionsTests
 
         using var provider = services.BuildServiceProvider();
 
+        provider.GetRequiredService<IServerTokenCache>().ShouldBeOfType<ServerTokenCache>();
+        provider.GetRequiredService<IDistributedCache>().ShouldBeOfType<MemoryDistributedCache>();
+    }
+
+    [Fact]
+    public void AddBlazorTokenForwarding_PreRegisteredDistributedCache_IsPreserved()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddScoped(_ => Substitute.For<AuthenticationStateProvider>());
+
+        var distributedCache = Substitute.For<IDistributedCache>();
+        services.AddSingleton(distributedCache);
+
+        services.AddBlazorTokenForwarding(BuildConfiguration([]));
+
+        using var provider = services.BuildServiceProvider();
+
+        provider.GetRequiredService<IDistributedCache>().ShouldBeSameAs(distributedCache);
         provider.GetRequiredService<IServerTokenCache>().ShouldBeOfType<ServerTokenCache>();
     }
 

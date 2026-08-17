@@ -1,5 +1,7 @@
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using StackExchange.Redis;
 
 namespace SyntaxCircus.Blazor.Auth;
@@ -52,6 +54,9 @@ public static class BlazorTokenForwardingExtensions
         else
         {
             services.AddSingleton<IServerTokenCache, ServerTokenCache>();
+            services.TryAddSingleton<IDistributedCache, MemoryDistributedCache>();
+            services.TryAddSingleton<IOptions<MemoryDistributedCacheOptions>>(
+                Options.Create(new MemoryDistributedCacheOptions()));
         }
 
         return services;
