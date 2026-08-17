@@ -207,4 +207,64 @@ public class ApiAuthHandlerTests
 
         harness.SessionState.IsSessionExpired.ShouldBeFalse();
     }
+
+    [Fact]
+    public async Task CircuitPathRefreshThenHttpPathResolutionWithStaleCookie_HttpPathUsesCachesRotatedRefreshTokenInsteadOfFailingOnStaleCookie()
+    {
+        var tokenCache = new ServerTokenCache();
+        await tokenCache.SetAsync("user:user-1", new ServerTokenCacheEntry("circuit-access-1", "refresh-1", null, DateTimeOffset.UtcNow.AddMinutes(-1)), TestContext.Current.CancellationToken);
+
+        var refreshTokenAlreadyUsed = new HashSet<string>(StringComparer.Ordinal);
+        var (rotatingRefreshService, _) = RefreshServiceFactory.Create(request =>
+        {
+            var body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            var sentRefreshToken = body.Split('&').Select(p => p.Split('=', 2)).First(p => p[0] == "refresh_token")[1];
+
+            if (!refreshTokenAlreadyUsed.Add(sentRefreshToken))
+            {
+                // A rotation-enforcing IdP rejects a replayed/already-used refresh token.
+                return new HttpResponseMessage(HttpStatusCode.BadRequest);
+            }
+
+            return sentRefreshToken switch
+            {
+                "refresh-1" => new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(new { access_token = "circuit-access-2", refresh_token = "refresh-2", expires_in = 3600 }),
+                },
+                "refresh-2" => new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(new { access_token = "http-path-refreshed-access", refresh_token = "refresh-3", expires_in = 3600 }),
+                },
+                _ => new HttpResponseMessage(HttpStatusCode.BadRequest),
+            };
+        });
+
+        var circuitHarness = CreateHandler(null, AuthenticatedPrincipal("user-1"), _ => new HttpResponseMessage(HttpStatusCode.OK), tokenCache, rotatingRefreshService);
+
+        // Circuit-path refresh: rotates refresh-1 -> refresh-2 in the shared cache, with no HttpContext
+        // available to persist the rotation back to the (stale) auth cookie.
+        await Send(circuitHarness.Handler);
+        circuitHarness.InnerHandler.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer circuit-access-2");
+
+        // Simulate time passing: the circuit's own cached access token has since also expired (e.g. the
+        // tab went idle long enough that no further outgoing call kept it silently renewed), while its
+        // rotated refresh token is still valid at the IdP.
+        await tokenCache.SetAsync("user:user-1", new ServerTokenCacheEntry("circuit-access-2", "refresh-2", null, DateTimeOffset.UtcNow.AddMinutes(-1)), TestContext.Current.CancellationToken);
+
+        // A subsequent full HTTP request still carries the ORIGINAL, now-stale cookie (access-1/refresh-1)
+        // — as it would if the cookie were never re-signed by the circuit path.
+        var (context, _) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "access-1",
+            ["refresh_token"] = "refresh-1",
+            ["expires_at"] = DateTimeOffset.UtcNow.AddMinutes(-5).UtcDateTime.ToString("O"),
+        });
+        var httpPathResolver = CreateResolver(tokenCache, rotatingRefreshService);
+
+        var resolution = await httpPathResolver.ResolveAsync(context, TestContext.Current.CancellationToken);
+
+        resolution.Token.ShouldBe("http-path-refreshed-access");
+        resolution.IsExpired.ShouldBeFalse();
+    }
 }

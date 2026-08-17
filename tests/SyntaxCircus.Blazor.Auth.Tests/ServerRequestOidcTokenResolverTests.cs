@@ -233,4 +233,69 @@ public class ServerRequestOidcTokenResolverTests
         resolution.Token.ShouldBe("access-1");
         resolution.IsExpired.ShouldBeFalse();
     }
+
+    [Fact]
+    public async Task ResolveAsync_NearExpiryCookieButCacheHasDivergedRefreshTokenAndFreshAccessToken_UsesCachedTokenAndResyncsCookieWithoutRefreshing()
+    {
+        var (context, authService) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "access-1",
+            ["refresh_token"] = "refresh-1",
+            ["expires_at"] = DateTimeOffset.UtcNow.AddSeconds(30).UtcDateTime.ToString("O"),
+        });
+        var tokenCache = new ServerTokenCache();
+        await tokenCache.SetAsync("user:user-1", new ServerTokenCacheEntry("cache-fresher-access", "refresh-2", null, DateTimeOffset.UtcNow.AddHours(1)), TestContext.Current.CancellationToken);
+        var resolver = CreateResolver(tokenCache, CreateNeverCalledRefreshService(), refreshSkewSeconds: 60);
+
+        var resolution = await resolver.ResolveAsync(context, TestContext.Current.CancellationToken);
+
+        resolution.Token.ShouldBe("cache-fresher-access");
+        resolution.IsExpired.ShouldBeFalse();
+        await authService.Received(1).SignInAsync(
+            context,
+            CookieAuthenticationDefaults.AuthenticationScheme,
+            Arg.Any<ClaimsPrincipal>(),
+            Arg.Any<AuthenticationProperties>());
+    }
+
+    [Fact]
+    public async Task ResolveAsync_NearExpiryCookieStaleAndCacheAccessTokenAlsoExpiredButRefreshTokenRotated_RefreshesWithCachedRefreshTokenNotCookies()
+    {
+        var (context, authService) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "access-1",
+            ["refresh_token"] = "refresh-1",
+            ["expires_at"] = DateTimeOffset.UtcNow.AddMinutes(-5).UtcDateTime.ToString("O"),
+        });
+        var tokenCache = new ServerTokenCache();
+        await tokenCache.SetAsync("user:user-1", new ServerTokenCacheEntry("cache-stale-access", "refresh-2", null, DateTimeOffset.UtcNow.AddMinutes(-1)), TestContext.Current.CancellationToken);
+        var (refreshService, _) = RefreshServiceFactory.Create(request =>
+        {
+            var body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            if (body.Contains("refresh_token=refresh-2", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(new { access_token = "refreshed-access", refresh_token = "refresh-3", expires_in = 3600 }),
+                };
+            }
+
+            // The cookie's refresh token (refresh-1) has already been rotated away at the IdP.
+            return new HttpResponseMessage(HttpStatusCode.BadRequest);
+        });
+        var resolver = CreateResolver(tokenCache, refreshService, refreshSkewSeconds: 60);
+
+        var resolution = await resolver.ResolveAsync(context, TestContext.Current.CancellationToken);
+
+        resolution.Token.ShouldBe("refreshed-access");
+        resolution.IsExpired.ShouldBeFalse();
+        var cached = await tokenCache.GetAsync("user:user-1", TestContext.Current.CancellationToken);
+        cached!.AccessToken.ShouldBe("refreshed-access");
+        cached.RefreshToken.ShouldBe("refresh-3");
+        await authService.Received(1).SignInAsync(
+            context,
+            CookieAuthenticationDefaults.AuthenticationScheme,
+            Arg.Any<ClaimsPrincipal>(),
+            Arg.Any<AuthenticationProperties>());
+    }
 }
