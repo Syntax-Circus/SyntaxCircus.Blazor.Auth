@@ -96,8 +96,6 @@ If the current circuit/request is anonymous and `Api:ClientCredentials` is confi
 ## Extras
 
 - `SyntaxCircus.Blazor.Auth.Diagnostics.AuthDebugEndpoints.MapAuthDebugEndpoints()` — opt-in `/debug/claims` and `/debug/token` endpoints for inspecting the current principal and cached tokens. Never wired automatically; call it yourself, gated behind `IsDevelopment()`. Raw token values are redacted by default (only a preview is returned) — pass `?includeRaw=true` to see them. Don't expose this outside development.
-- `SyntaxCircus.Blazor.Auth.Components.Errors.GlobalErrorBoundary` / `GlobalErrorView` / `LoggingErrorBoundary` — a Bootstrap-styled error boundary that logs unhandled exceptions and auto-recovers on navigation.
-- `SyntaxCircus.Blazor.Auth.Components.Layout.ReconnectModal` — the standard Blazor Server reconnect-UI markup (rejoin animation, pause/resume states).
 
 ## Contributing
 

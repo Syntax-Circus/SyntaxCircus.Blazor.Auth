@@ -19,8 +19,6 @@ src/SyntaxCircus.Blazor.Auth/
                                           ApiClientCredentialsTokenProvider, IUserTokenCacheKeyProvider, UserTokenCacheKeyProvider
   Options/                             — AuthOptions, ApiOptions, ApiClientCredentialsOptions
   Diagnostics/                         — namespace SyntaxCircus.Blazor.Auth.Diagnostics; AuthDebugEndpoints (opt-in)
-  Components/Errors/                   — namespace SyntaxCircus.Blazor.Auth.Components.Errors; GlobalErrorBoundary etc.
-  Components/Layout/                   — namespace SyntaxCircus.Blazor.Auth.Components.Layout; ReconnectModal
 
 tests/SyntaxCircus.Blazor.Auth.Tests/
   mirrors src/ 1:1 by filename, e.g. ApiAuthHandlerTests.cs ↔ ApiAuthHandler.cs
