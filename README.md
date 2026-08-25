@@ -41,6 +41,11 @@ What each call does:
 - **`UseBlazorTokenCache()`** — middleware that eagerly resolves (and refreshes) the current request's token while response headers are still writable, so a refreshed cookie can actually be persisted. See [How it works](#how-it-works) for why the pipeline position matters.
 - **`.AddHttpMessageHandler<ApiAuthHandler>()`** — attach to any typed `HttpClient` you want the bearer token forwarded to.
 
+If your application already keeps its OIDC options under a different configuration section, pass
+that section name as the optional third argument: `services.AddBlazorTokenForwarding(configuration,
+"MyApplication:Oidc")`. The selected section supplies `AuthOptions`; `Api` and
+`Api:ClientCredentials` continue to use their documented sections.
+
 ## How it works
 
 Tokens are resolved differently depending on where the outgoing call happens:
