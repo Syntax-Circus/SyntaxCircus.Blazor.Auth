@@ -36,10 +36,21 @@ app.UseBlazorTokenCache(); // after UseAuthorization(), before antiforgery
 app.UseAntiforgery();
 ```
 
+For an interactive Blazor circuit, create the named client from the scoped
+`IBlazorCircuitHttpClientFactory` rather than directly from `IHttpClientFactory`. It preserves the
+named pipeline and supplies the circuit's server-side token-cache key to `ApiAuthHandler`; it never
+places an access token or cache key in a request header or browser-visible state. Ordinary HTTP
+request-only clients may continue using `IHttpClientFactory`.
+
 What each call does:
 - **`AddBlazorTokenForwarding(configuration)`** — registers the token cache (in-process or Redis-backed, see below), the refresh/resolver services, the client-credentials (M2M) fallback provider, and `ApiAuthHandler`.
 - **`UseBlazorTokenCache()`** — middleware that eagerly resolves (and refreshes) the current request's token while response headers are still writable, so a refreshed cookie can actually be persisted. See [How it works](#how-it-works) for why the pipeline position matters.
 - **`.AddHttpMessageHandler<ApiAuthHandler>()`** — attach to any typed `HttpClient` you want the bearer token forwarded to.
+
+If your application already keeps its OIDC options under a different configuration section, pass
+that section name as the optional third argument: `services.AddBlazorTokenForwarding(configuration,
+"MyApplication:Oidc")`. The selected section supplies `AuthOptions`; `Api` and
+`Api:ClientCredentials` continue to use their documented sections.
 
 ## How it works
 
@@ -47,6 +58,11 @@ Tokens are resolved differently depending on where the outgoing call happens:
 
 - **Normal HTTP request** — `HttpContext` is available, so the resolver reads the token straight from the authentication cookie (refreshing and re-signing the cookie in place if it's near expiry).
 - **SignalR circuit** (interactive Blazor Server, after the initial page load) — there's no `HttpContext`. The handler falls back to the server-side `IServerTokenCache`, refreshing in place using the cached refresh token if needed.
+
+An interactive circuit must obtain that client through `IBlazorCircuitHttpClientFactory`. The scoped
+factory wraps the existing named `IHttpClientFactory` pipeline and puts only the caller's exact token
+cache key in an internal `HttpRequestMessage.Options` entry. This keeps separately rendered circuits
+isolated while retaining handler pooling and named-client configuration.
 
 `UseBlazorTokenCache()` must run **after `UseAuthorization()` and before `UseAntiforgery()`**: this is the last point in the pipeline where response headers are still writable, which is what lets a refreshed cookie actually get persisted back to the browser. Moving it later means a mid-request refresh has nowhere to write the new cookie.
 

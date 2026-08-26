@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Components.Authorization;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -15,31 +16,52 @@ public static class BlazorTokenForwardingExtensions
     /// <see cref="ApiAuthHandler"/> for use as a typed-client <c>DelegatingHandler</c>.
     /// </summary>
     public static IServiceCollection AddBlazorTokenForwarding(this IServiceCollection services, IConfiguration configuration)
+        => AddBlazorTokenForwarding(services, configuration, AuthOptions.SectionName);
+
+    /// <summary>
+    /// Registers Blazor Server OIDC token forwarding using <paramref name="authSectionName"/> for
+    /// <see cref="AuthOptions"/>. This lets host applications keep provider configuration under
+    /// their existing authentication section while retaining the package defaults for API options.
+    /// </summary>
+    public static IServiceCollection AddBlazorTokenForwarding(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        string authSectionName)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentException.ThrowIfNullOrWhiteSpace(authSectionName);
 
         services.AddHttpContextAccessor();
+        services.AddSingleton<SessionExpiryBroker>();
         services.AddScoped<SessionStateService>();
+        services.AddScoped<IBlazorCircuitHttpClientFactory, BlazorCircuitHttpClientFactory>();
         services.AddSingleton<IUserTokenCacheKeyProvider, UserTokenCacheKeyProvider>();
         services.AddScoped<ServerRequestOidcTokenResolver>();
-        services.AddTransient<ApiAuthHandler>();
+        services.AddTransient<ApiAuthHandler>(sp => new ApiAuthHandler(
+            sp.GetRequiredService<IHttpContextAccessor>(),
+            sp.GetRequiredService<IServerTokenCache>(),
+            sp.GetRequiredService<ServerRequestOidcTokenResolver>(),
+            sp.GetRequiredService<OidcTokenRefreshService>(),
+            sp.GetRequiredService<IApiClientCredentialsTokenProvider>(),
+            sp.GetRequiredService<ILogger<ApiAuthHandler>>(),
+            sp.GetRequiredService<SessionExpiryBroker>()));
         services.AddHttpClient<OidcTokenRefreshService>();
 
-        services.Configure<AuthOptions>(configuration.GetSection(AuthOptions.SectionName));
+        services.Configure<AuthOptions>(configuration.GetSection(authSectionName));
         services.Configure<ApiOptions>(configuration.GetSection(ApiOptions.SectionName));
         services.Configure<ApiClientCredentialsOptions>(configuration.GetSection(ApiClientCredentialsOptions.SectionName));
 
         services.AddHttpClient(ApiClientCredentialsTokenProvider.HttpClientName);
         services.AddSingleton<IApiClientCredentialsTokenProvider, ApiClientCredentialsTokenProvider>();
 
-        var redisOptions = configuration.GetSection(AuthOptions.SectionName).Get<AuthOptions>()?.TokenCache.Redis;
+        var redisOptions = configuration.GetSection(authSectionName).Get<AuthOptions>()?.TokenCache.Redis;
         if (redisOptions is { Enabled: true } && !string.IsNullOrWhiteSpace(redisOptions.ConnectionString))
         {
             services.AddStackExchangeRedisCache(cacheOptions =>
             {
                 cacheOptions.Configuration = redisOptions.ConnectionString;
-                cacheOptions.InstanceName = redisOptions.InstanceName;
+                cacheOptions.InstanceName = string.Empty;
             });
 
             var protectionProvider = redisOptions.Protection.Enabled
