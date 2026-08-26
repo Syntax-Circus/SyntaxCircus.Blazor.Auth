@@ -141,6 +141,30 @@ public class BlazorTokenForwardingExtensionsTests
     }
 
     [Fact]
+    public void AddBlazorTokenForwarding_SessionExpirySignalIsVisibleAcrossHandlerAndCircuitScopesForTheSameUserOnly()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddScoped(_ => Substitute.For<AuthenticationStateProvider>());
+        services.AddBlazorTokenForwarding(BuildConfiguration([]));
+
+        using var provider = services.BuildServiceProvider();
+        using var handlerScope = provider.CreateScope();
+        using var circuitScope = provider.CreateScope();
+        var circuitSignal = circuitScope.ServiceProvider.GetRequiredService<SessionStateService>();
+        circuitSignal.Observe("user:one");
+        using var otherCircuitScope = provider.CreateScope();
+        var otherCircuitSignal = otherCircuitScope.ServiceProvider.GetRequiredService<SessionStateService>();
+        otherCircuitSignal.Observe("user:two");
+        var broker = handlerScope.ServiceProvider.GetRequiredService<SessionExpiryBroker>();
+
+        broker.Publish("user:one");
+
+        circuitSignal.IsSessionExpired.ShouldBeTrue();
+        otherCircuitSignal.IsSessionExpired.ShouldBeFalse();
+    }
+
+    [Fact]
     public void AddBlazorTokenForwarding_RegistersCoreServices()
     {
         var services = new ServiceCollection();

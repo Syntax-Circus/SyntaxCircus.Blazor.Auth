@@ -10,6 +10,8 @@ namespace SyntaxCircus.Blazor.Auth.Tests;
 /// </summary>
 public class ApiAuthHandlerTests
 {
+    private static readonly HttpRequestOptionsKey<string> CircuitCacheKey = new("SyntaxCircus.Blazor.Auth.CacheKey");
+
     private static OidcTokenRefreshService CreateNeverCalledRefreshService()
         => RefreshServiceFactory.Create(_ => throw new InvalidOperationException("Refresh should not have been called.")).Service;
 
@@ -40,7 +42,7 @@ public class ApiAuthHandlerTests
 
     private static ClaimsPrincipal AnonymousPrincipal() => new(new ClaimsIdentity());
 
-    private sealed record Harness(ApiAuthHandler Handler, StubHttpMessageHandler InnerHandler, IServerTokenCache TokenCache, SessionStateService SessionState, IApiClientCredentialsTokenProvider ClientCredentialsProvider);
+    private sealed record Harness(ApiAuthHandler Handler, StubHttpMessageHandler InnerHandler, IServerTokenCache TokenCache, SessionStateService SessionState, SessionExpiryBroker Broker, IApiClientCredentialsTokenProvider ClientCredentialsProvider);
 
     private static Harness CreateHandler(
         HttpContext? httpContext,
@@ -54,7 +56,8 @@ public class ApiAuthHandlerTests
         tokenCache ??= new ServerTokenCache();
         refreshService ??= CreateNeverCalledRefreshService();
         var resolver = CreateResolver(tokenCache, refreshService);
-        var sessionState = new SessionStateService();
+        var broker = new SessionExpiryBroker();
+        var sessionState = new SessionStateService(broker);
         var clientCredentialsProvider = Substitute.For<IApiClientCredentialsTokenProvider>();
         clientCredentialsProvider.IsConfigured.Returns(clientCredentialsConfigured);
         if (clientCredentialsConfigured)
@@ -76,13 +79,159 @@ public class ApiAuthHandlerTests
         var innerHandler = new StubHttpMessageHandler(innerResponder);
         handler.InnerHandler = innerHandler;
 
-        return new Harness(handler, innerHandler, tokenCache, sessionState, clientCredentialsProvider);
+        return new Harness(handler, innerHandler, tokenCache, sessionState, broker, clientCredentialsProvider);
     }
 
-    private static Task<HttpResponseMessage> Send(ApiAuthHandler handler, string url = "https://api.example.com/things")
+    private static Task<HttpResponseMessage> Send(ApiAuthHandler handler, string url = "https://api.example.com/things", string? cacheKey = null)
     {
         using var invoker = new HttpMessageInvoker(handler);
-        return invoker.SendAsync(new HttpRequestMessage(HttpMethod.Get, url), TestContext.Current.CancellationToken);
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        if (!string.IsNullOrWhiteSpace(cacheKey))
+        {
+            request.Options.Set(CircuitCacheKey, cacheKey);
+        }
+
+        return invoker.SendAsync(request, TestContext.Current.CancellationToken);
+    }
+
+    private static ServiceProvider BuildRegisteredProvider(ClaimsPrincipal principal, HttpMessageHandler? refreshHandler = null, IApiClientCredentialsTokenProvider? clientCredentials = null)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddOptions();
+        services.Configure<OpenIdConnectOptions>(OpenIdConnectDefaults.AuthenticationScheme, options =>
+            options.Configuration = new OpenIdConnectConfiguration { TokenEndpoint = "https://identity.example.com/token" });
+        services.AddScoped<AuthenticationStateProvider>(_ => CreateAuthStateProvider(principal));
+        services.AddBlazorTokenForwarding(BuildConfiguration([]));
+        if (clientCredentials is not null)
+        {
+            services.AddSingleton(clientCredentials);
+        }
+
+        if (refreshHandler is not null)
+        {
+            services.AddHttpClient<OidcTokenRefreshService>()
+                .ConfigurePrimaryHttpMessageHandler(() => refreshHandler);
+        }
+
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private static IConfiguration BuildConfiguration(Dictionary<string, string?> values)
+        => new ConfigurationBuilder().AddInMemoryCollection(values).Build();
+
+    [Fact]
+    public async Task RegisteredHandler_UserOidc401_EvictsAndPublishesExactKeyToSameUserCircuitOnly()
+    {
+        using var provider = BuildRegisteredProvider(AuthenticatedPrincipal("user-1"));
+        using var sameUserCircuit = provider.CreateScope();
+        using var otherUserCircuit = provider.CreateScope();
+        var sameUserState = sameUserCircuit.ServiceProvider.GetRequiredService<SessionStateService>();
+        var otherUserState = otherUserCircuit.ServiceProvider.GetRequiredService<SessionStateService>();
+        sameUserState.Observe("user:user-1");
+        otherUserState.Observe("user:user-2");
+        var cache = provider.GetRequiredService<IServerTokenCache>();
+        var (context, _) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "cookie-access",
+            ["expires_at"] = DateTimeOffset.UtcNow.AddHours(1).UtcDateTime.ToString("O"),
+        });
+
+        using var handlerScope = provider.CreateScope();
+        handlerScope.ServiceProvider.GetRequiredService<IHttpContextAccessor>().HttpContext = context;
+        var handler = handlerScope.ServiceProvider.GetRequiredService<ApiAuthHandler>();
+        handler.InnerHandler = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
+
+        await Send(handler, cacheKey: "user:user-1");
+
+        (await cache.GetAsync("user:user-1", TestContext.Current.CancellationToken)).ShouldBeNull();
+        sameUserState.IsSessionExpired.ShouldBeTrue();
+        otherUserState.IsSessionExpired.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task RegisteredHandler_RequestPathExpiredResolution_PublishesExactKeyBeforeDownstreamUnauthorized()
+    {
+        using var provider = BuildRegisteredProvider(AuthenticatedPrincipal("user-1"));
+        using var circuit = provider.CreateScope();
+        var circuitState = circuit.ServiceProvider.GetRequiredService<SessionStateService>();
+        circuitState.Observe("user:user-1");
+        var (context, _) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "expired-access",
+            ["expires_at"] = DateTimeOffset.UtcNow.AddMinutes(-10).UtcDateTime.ToString("O"),
+        });
+
+        using var handlerScope = provider.CreateScope();
+        handlerScope.ServiceProvider.GetRequiredService<IHttpContextAccessor>().HttpContext = context;
+        var handler = handlerScope.ServiceProvider.GetRequiredService<ApiAuthHandler>();
+        handler.InnerHandler = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+
+        var response = await Send(handler);
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        circuitState.IsSessionExpired.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task RegisteredHandler_CircuitRefreshFailure_PublishesExactKeyToCircuit()
+    {
+        using var provider = BuildRegisteredProvider(
+            AuthenticatedPrincipal("user-1"),
+            new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.BadRequest)));
+        using var circuit = provider.CreateScope();
+        var circuitState = circuit.ServiceProvider.GetRequiredService<SessionStateService>();
+        circuitState.Observe("user:user-1");
+        var cache = provider.GetRequiredService<IServerTokenCache>();
+        await cache.SetAsync(
+            "user:user-1",
+            new ServerTokenCacheEntry("expired-access", "refresh-token", null, DateTimeOffset.UtcNow.AddMinutes(-10)),
+            TestContext.Current.CancellationToken);
+
+        using var handlerScope = provider.CreateScope();
+        handlerScope.ServiceProvider.GetRequiredService<IHttpContextAccessor>().HttpContext = null;
+        var handler = handlerScope.ServiceProvider.GetRequiredService<ApiAuthHandler>();
+        handler.InnerHandler = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+
+        await Send(handler, cacheKey: "user:user-1");
+
+        circuitState.IsSessionExpired.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void RegisteredApiAuthHandler_RequiresSessionExpiryBroker()
+    {
+        using var provider = BuildRegisteredProvider(AuthenticatedPrincipal("user-1"));
+        using var scope = provider.CreateScope();
+
+        scope.ServiceProvider.GetRequiredService<ApiAuthHandler>().ShouldNotBeNull();
+        typeof(ApiAuthHandler).GetConstructors()
+            .Any(constructor => constructor.GetParameters().Any(parameter => parameter.ParameterType == typeof(SessionExpiryBroker)))
+            .ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task RegisteredHandler_MissingCircuitOption_UsesClientCredentialsAndDoesNotPublishUserExpiryOn401()
+    {
+        var m2m = Substitute.For<IApiClientCredentialsTokenProvider>();
+        m2m.IsConfigured.Returns(true);
+        m2m.GetAccessTokenAsync(Arg.Any<CancellationToken>()).Returns("m2m-token");
+        using var provider = BuildRegisteredProvider(AnonymousPrincipal(), clientCredentials: m2m);
+        using var circuit = provider.CreateScope();
+        var state = circuit.ServiceProvider.GetRequiredService<SessionStateService>();
+        state.Observe("user:one");
+        var cache = provider.GetRequiredService<IServerTokenCache>();
+        await cache.SetAsync("user:one", new ServerTokenCacheEntry("user-token", "refresh", null, DateTimeOffset.UtcNow.AddHours(1)), TestContext.Current.CancellationToken);
+        using var handlerScope = provider.CreateScope();
+        handlerScope.ServiceProvider.GetRequiredService<IHttpContextAccessor>().HttpContext = null;
+        var handler = handlerScope.ServiceProvider.GetRequiredService<ApiAuthHandler>();
+        handler.InnerHandler = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
+
+        await Send(handler);
+
+        handler.InnerHandler.ShouldBeOfType<StubHttpMessageHandler>().LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer m2m-token");
+        state.IsSessionExpired.ShouldBeFalse();
+        (await cache.GetAsync("user:one", TestContext.Current.CancellationToken)).ShouldNotBeNull();
     }
 
     [Fact]
@@ -149,6 +298,24 @@ public class ApiAuthHandlerTests
     }
 
     [Fact]
+    public async Task SendAsync_HttpContextPresent_IgnoresConflictingCircuitCacheKey()
+    {
+        var cache = new ServerTokenCache();
+        await cache.SetAsync("user:conflict", new ServerTokenCacheEntry("conflict-access", "refresh", null, DateTimeOffset.UtcNow.AddHours(1)), TestContext.Current.CancellationToken);
+        var (context, _) = FakeAuthenticationContext.CreateAuthenticated("cookie-user", new Dictionary<string, string>
+        {
+            ["access_token"] = "cookie-access",
+            ["expires_at"] = DateTimeOffset.UtcNow.AddHours(1).UtcDateTime.ToString("O"),
+        });
+        var harness = CreateHandler(context, AnonymousPrincipal(), _ => new HttpResponseMessage(HttpStatusCode.OK), cache);
+
+        await Send(harness.Handler, cacheKey: "user:conflict");
+
+        harness.InnerHandler.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer cookie-access");
+        (await cache.GetAsync("user:conflict", TestContext.Current.CancellationToken))!.AccessToken.ShouldBe("conflict-access");
+    }
+
+    [Fact]
     public async Task SendAsync_HttpContextPresentButAnonymous_ClientCredentialsConfigured_FallsBackToM2MToken()
     {
         var (context, _) = FakeAuthenticationContext.CreateUnauthenticated();
@@ -190,6 +357,7 @@ public class ApiAuthHandlerTests
         var tokenCache = new ServerTokenCache();
         await tokenCache.SetAsync("user:user-1", new ServerTokenCacheEntry("cached-access", "cached-refresh", null, DateTimeOffset.UtcNow.AddHours(1)), TestContext.Current.CancellationToken);
         var harness = CreateHandler(null, AuthenticatedPrincipal("user-1"), _ => new HttpResponseMessage(HttpStatusCode.Unauthorized), tokenCache);
+        harness.SessionState.Observe("user:user-1");
 
         await Send(harness.Handler);
 

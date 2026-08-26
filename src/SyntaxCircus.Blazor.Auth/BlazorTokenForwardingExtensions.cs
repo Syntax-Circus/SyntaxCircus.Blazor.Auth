@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Components.Authorization;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -32,10 +33,19 @@ public static class BlazorTokenForwardingExtensions
         ArgumentException.ThrowIfNullOrWhiteSpace(authSectionName);
 
         services.AddHttpContextAccessor();
+        services.AddSingleton<SessionExpiryBroker>();
         services.AddScoped<SessionStateService>();
+        services.AddScoped<IBlazorCircuitHttpClientFactory, BlazorCircuitHttpClientFactory>();
         services.AddSingleton<IUserTokenCacheKeyProvider, UserTokenCacheKeyProvider>();
         services.AddScoped<ServerRequestOidcTokenResolver>();
-        services.AddTransient<ApiAuthHandler>();
+        services.AddTransient<ApiAuthHandler>(sp => new ApiAuthHandler(
+            sp.GetRequiredService<IHttpContextAccessor>(),
+            sp.GetRequiredService<IServerTokenCache>(),
+            sp.GetRequiredService<ServerRequestOidcTokenResolver>(),
+            sp.GetRequiredService<OidcTokenRefreshService>(),
+            sp.GetRequiredService<IApiClientCredentialsTokenProvider>(),
+            sp.GetRequiredService<ILogger<ApiAuthHandler>>(),
+            sp.GetRequiredService<SessionExpiryBroker>()));
         services.AddHttpClient<OidcTokenRefreshService>();
 
         services.Configure<AuthOptions>(configuration.GetSection(authSectionName));
@@ -51,7 +61,7 @@ public static class BlazorTokenForwardingExtensions
             services.AddStackExchangeRedisCache(cacheOptions =>
             {
                 cacheOptions.Configuration = redisOptions.ConnectionString;
-                cacheOptions.InstanceName = redisOptions.InstanceName;
+                cacheOptions.InstanceName = string.Empty;
             });
 
             var protectionProvider = redisOptions.Protection.Enabled
