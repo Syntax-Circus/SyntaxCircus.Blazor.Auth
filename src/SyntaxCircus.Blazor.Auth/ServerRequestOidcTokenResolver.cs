@@ -35,8 +35,8 @@ public sealed class ServerRequestOidcTokenResolver(
         // milliseconds), but a Blazor Server interactive circuit's HttpContext is the ambient
         // context for the *entire* SignalR connection - it can live for hours. Without the
         // ValidUntilUtc check below, the very first resolution computed for a circuit would be
-        // returned forever, silently going stale and never re-checking/refreshing (see
-        // docs/enhancements for the write-up of this bug).
+        // returned forever, silently going stale and never re-checking/refreshing (see the README's
+        // "Behavioral notes" for this bug).
         if (httpContext.Items.TryGetValue(HttpContextItemKey, out var cached)
             && cached is CachedResolution cachedResolution
             && cachedResolution.ValidUntilUtc > clock.GetUtcNow())
