@@ -1,3 +1,5 @@
+using NSubstitute.Core;
+
 namespace SyntaxCircus.Blazor.Auth.Tests;
 
 public class ServerRequestOidcTokenResolverTests
@@ -6,7 +8,8 @@ public class ServerRequestOidcTokenResolverTests
         IServerTokenCache tokenCache,
         OidcTokenRefreshService refreshService,
         int refreshSkewSeconds = 60,
-        int fallbackLifetimeSeconds = 300)
+        int fallbackLifetimeSeconds = 300,
+        TimeProvider? timeProvider = null)
     {
         var options = Options.Create(new AuthOptions
         {
@@ -22,7 +25,18 @@ public class ServerRequestOidcTokenResolverTests
             refreshService,
             new UserTokenCacheKeyProvider(),
             options,
-            NullLogger<ServerRequestOidcTokenResolver>.Instance);
+            NullLogger<ServerRequestOidcTokenResolver>.Instance,
+            timeProvider);
+    }
+
+    /// <summary>A <see cref="TimeProvider"/> whose clock only moves when <see cref="Advance"/> is called.</summary>
+    private sealed class ManualTimeProvider(DateTimeOffset start) : TimeProvider
+    {
+        private DateTimeOffset now = start;
+
+        public void Advance(TimeSpan by) => now += by;
+
+        public override DateTimeOffset GetUtcNow() => now;
     }
 
     private static OidcTokenRefreshService CreateNeverCalledRefreshService()
@@ -232,6 +246,50 @@ public class ServerRequestOidcTokenResolverTests
 
         resolution.Token.ShouldBe("access-1");
         resolution.IsExpired.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task ResolveAsync_LongLivedCircuitContext_PastCachedValidityWindow_ReResolvesInsteadOfReusingStaleResolutionForever()
+    {
+        var start = DateTimeOffset.UtcNow;
+        var (context, authService) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "access-1",
+            ["expires_at"] = start.AddMinutes(2).UtcDateTime.ToString("O"),
+        });
+        var clock = new ManualTimeProvider(start);
+        var resolver = CreateResolver(new ServerTokenCache(), CreateNeverCalledRefreshService(), refreshSkewSeconds: 60, timeProvider: clock);
+
+        // First call, simulating a Blazor Server circuit's very first API call. Its resolution gets
+        // cached onto the same HttpContext.Items instance that this circuit's ambient HttpContext
+        // keeps alive for its entire (potentially hours-long) SignalR connection.
+        var first = await resolver.ResolveAsync(context, TestContext.Current.CancellationToken);
+        first.Token.ShouldBe("access-1");
+
+        // A second call on the SAME HttpContext, still well inside the token's validity window,
+        // must keep reusing the cached resolution rather than re-authenticating (existing
+        // single-resolution-per-request behavior/perf optimization). (No "refresh_token" is stored
+        // on this fixture, so each *real* resolution costs two AuthenticateAsync calls - one
+        // directly, one via the fallback HttpContext.GetTokenAsync lookup for the absent
+        // refresh_token - so "no new real resolution happened" shows up as the call count staying
+        // flat across this second call, not as exactly one call overall.)
+        await resolver.ResolveAsync(context, TestContext.Current.CancellationToken);
+        var callsAfterCacheHit = authService.ReceivedCalls().Count(call => call.GetMethodInfo().Name == nameof(IAuthenticationService.AuthenticateAsync));
+        callsAfterCacheHit.ShouldBe(2);
+
+        // Advance the clock past the access token's (skew-adjusted) validity window without the
+        // circuit ever producing a new HTTP request - exactly what "Admin tab left open several
+        // minutes past the last successful call, no reload" looks like in production. The resolver
+        // must now re-check the cookie/cache instead of returning the same resolution it computed
+        // minutes earlier.
+        clock.Advance(TimeSpan.FromMinutes(3));
+
+        var third = await resolver.ResolveAsync(context, TestContext.Current.CancellationToken);
+
+        var callsAfterReResolve = authService.ReceivedCalls().Count(call => call.GetMethodInfo().Name == nameof(IAuthenticationService.AuthenticateAsync));
+        callsAfterReResolve.ShouldBe(4, "a real re-resolution should have happened once the cached validity window elapsed");
+        third.Token.ShouldBeNull();
+        third.IsExpired.ShouldBeTrue();
     }
 
     [Fact]

@@ -8,31 +8,75 @@ namespace SyntaxCircus.Blazor.Auth;
 /// Resolves the current request's OIDC access token: reads it from the auth cookie, refreshes it
 /// (lock-guarded, cache-checked) when it's within <c>RefreshSkewSeconds</c> of expiry, and falls
 /// back to <see cref="IServerTokenCache"/> when the cookie has nothing usable for this request.
-/// Caches its result on <see cref="HttpContext.Items"/> so a single request only resolves once.
+/// Caches its result on <see cref="HttpContext.Items"/>, valid until the resolved token's own
+/// (skew-adjusted) expiry, so a single request only resolves once - but a Blazor Server circuit,
+/// whose ambient <see cref="HttpContext"/> spans its entire connection rather than one request,
+/// still re-resolves (and refreshes) once that validity window elapses instead of reusing the
+/// first-ever resolution forever.
 /// </summary>
 public sealed class ServerRequestOidcTokenResolver(
     IServerTokenCache tokenCache,
     OidcTokenRefreshService refreshService,
     IUserTokenCacheKeyProvider cacheKeyProvider,
     IOptions<AuthOptions> options,
-    ILogger<ServerRequestOidcTokenResolver> logger)
+    ILogger<ServerRequestOidcTokenResolver> logger,
+    TimeProvider? timeProvider = null)
 {
     internal const string HttpContextItemKey = "SyntaxCircus.Blazor.Auth.ServerRequestOidcTokenResolution";
+
+    private readonly TimeProvider clock = timeProvider ?? TimeProvider.System;
 
     public async Task<ServerRequestOidcTokenResolution> ResolveAsync(HttpContext httpContext, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(httpContext);
 
+        // The cached resolution is only safe to reuse while its underlying token is still fresh.
+        // For a normal HTTP request that's a non-issue (the whole request completes in
+        // milliseconds), but a Blazor Server interactive circuit's HttpContext is the ambient
+        // context for the *entire* SignalR connection - it can live for hours. Without the
+        // ValidUntilUtc check below, the very first resolution computed for a circuit would be
+        // returned forever, silently going stale and never re-checking/refreshing (see the README's
+        // "Behavioral notes" for this bug).
         if (httpContext.Items.TryGetValue(HttpContextItemKey, out var cached)
-            && cached is ServerRequestOidcTokenResolution cachedResolution)
+            && cached is CachedResolution cachedResolution
+            && cachedResolution.ValidUntilUtc > clock.GetUtcNow())
         {
-            return cachedResolution;
+            return cachedResolution.Resolution;
         }
 
         var resolution = await ResolveCoreAsync(httpContext, cancellationToken).ConfigureAwait(false);
-        httpContext.Items[HttpContextItemKey] = resolution;
+        var validUntil = await ComputeValidUntilAsync(resolution, cancellationToken).ConfigureAwait(false);
+        httpContext.Items[HttpContextItemKey] = new CachedResolution(resolution, validUntil);
         return resolution;
     }
+
+    /// <summary>
+    /// Determines how long the just-computed <paramref name="resolution"/> may be reused from
+    /// <see cref="HttpContext.Items"/> before <see cref="ResolveAsync"/> must recompute it. Every
+    /// successful resolution path already persists its access token's real expiry to
+    /// <see cref="IServerTokenCache"/>, so re-reading that entry gives an accurate, skew-adjusted
+    /// validity window without threading extra state through <see cref="ResolveCoreAsync"/> and its
+    /// helpers. A resolution with no usable token/cache key is considered valid for zero time, so
+    /// the next call always retries.
+    /// </summary>
+    private async Task<DateTimeOffset> ComputeValidUntilAsync(ServerRequestOidcTokenResolution resolution, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(resolution.Token) || string.IsNullOrWhiteSpace(resolution.CacheKey))
+        {
+            return clock.GetUtcNow();
+        }
+
+        var entry = await tokenCache.GetAsync(resolution.CacheKey, cancellationToken).ConfigureAwait(false);
+        if (entry is null)
+        {
+            return clock.GetUtcNow();
+        }
+
+        var refreshSkew = TimeSpan.FromSeconds(Math.Max(0, options.Value.TokenCache.RefreshSkewSeconds));
+        return entry.ExpiresAtUtc - refreshSkew;
+    }
+
+    private sealed record CachedResolution(ServerRequestOidcTokenResolution Resolution, DateTimeOffset ValidUntilUtc);
 
     private async Task<ServerRequestOidcTokenResolution> ResolveCoreAsync(HttpContext httpContext, CancellationToken cancellationToken)
     {
@@ -57,7 +101,7 @@ public sealed class ServerRequestOidcTokenResolver(
 
         var refreshSkew = TimeSpan.FromSeconds(Math.Max(0, options.Value.TokenCache.RefreshSkewSeconds));
         var fallbackLifetime = TimeSpan.FromSeconds(Math.Max(30, options.Value.TokenCache.FallbackAccessTokenLifetimeSeconds));
-        var now = DateTimeOffset.UtcNow;
+        var now = clock.GetUtcNow();
 
         if (string.IsNullOrWhiteSpace(accessToken))
         {
@@ -161,7 +205,7 @@ public sealed class ServerRequestOidcTokenResolver(
         if (refreshed is null)
         {
             logger.LogWarning("OIDC token refresh failed for cache key '{CacheKey}'.", cacheKey);
-            var isExpired = currentExpiry <= DateTimeOffset.UtcNow;
+            var isExpired = currentExpiry <= clock.GetUtcNow();
             if (isExpired)
             {
                 await tokenCache.RemoveAsync(cacheKey, cancellationToken).ConfigureAwait(false);

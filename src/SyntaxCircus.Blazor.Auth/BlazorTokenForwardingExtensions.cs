@@ -33,6 +33,7 @@ public static class BlazorTokenForwardingExtensions
         ArgumentException.ThrowIfNullOrWhiteSpace(authSectionName);
 
         services.AddHttpContextAccessor();
+        services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<SessionExpiryBroker>();
         services.AddScoped<SessionStateService>();
         services.AddScoped<IBlazorCircuitHttpClientFactory, BlazorCircuitHttpClientFactory>();
