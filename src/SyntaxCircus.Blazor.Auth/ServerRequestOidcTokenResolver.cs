@@ -145,7 +145,7 @@ public sealed class ServerRequestOidcTokenResolver(
 
     /// <summary>
     /// Runs inside the per-cache-key refresh lock. Detects the case where a SignalR-circuit-path
-    /// refresh (<see cref="ApiAuthHandler.TryRefreshInCircuitAsync"/>) already rotated the refresh
+    /// refresh (<see cref="CachedUserTokenResolver.ResolveAsync"/>) already rotated the refresh
     /// token in <see cref="IServerTokenCache"/> with no HttpContext available to persist it back to
     /// the cookie — the stale cookie's refresh token may already be rejected by an OIDC provider
     /// that rotates refresh tokens on use. When the cache's refresh token differs from the cookie's,

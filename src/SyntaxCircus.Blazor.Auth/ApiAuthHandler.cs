@@ -24,6 +24,7 @@ public sealed class ApiAuthHandler : DelegatingHandler
     private readonly AuthenticationStateProvider? compatibilityAuthenticationStateProvider;
     private readonly IUserTokenCacheKeyProvider? compatibilityCacheKeyProvider;
     private readonly SessionStateService? compatibilitySessionStateService;
+    private readonly CachedUserTokenResolver userTokenResolver;
 
     /// <summary>Creates the handler used by the registered production path.</summary>
     public ApiAuthHandler(
@@ -34,7 +35,33 @@ public sealed class ApiAuthHandler : DelegatingHandler
         IApiClientCredentialsTokenProvider clientCredentialsTokenProvider,
         ILogger<ApiAuthHandler> logger,
         SessionExpiryBroker sessionExpiryBroker)
+        : this(
+            httpContextAccessor,
+            tokenCache,
+            resolver,
+            refreshService,
+            clientCredentialsTokenProvider,
+            logger,
+            sessionExpiryBroker,
+            new CachedUserTokenResolver(tokenCache, Options.Create(new AuthOptions())))
     {
+    }
+
+    /// <summary>
+    /// Creates the handler with the shared circuit-phase token resolver. Internal because the
+    /// resolver is; the DI registration uses this so the host's configured refresh skew applies.
+    /// </summary>
+    internal ApiAuthHandler(
+        IHttpContextAccessor httpContextAccessor,
+        IServerTokenCache tokenCache,
+        ServerRequestOidcTokenResolver resolver,
+        OidcTokenRefreshService refreshService,
+        IApiClientCredentialsTokenProvider clientCredentialsTokenProvider,
+        ILogger<ApiAuthHandler> logger,
+        SessionExpiryBroker sessionExpiryBroker,
+        CachedUserTokenResolver userTokenResolver)
+    {
+        this.userTokenResolver = userTokenResolver;
         this.httpContextAccessor = httpContextAccessor;
         this.tokenCache = tokenCache;
         this.resolver = resolver;
@@ -172,50 +199,8 @@ public sealed class ApiAuthHandler : DelegatingHandler
         }
     }
 
-    private async Task<string?> TryResolveCachedTokenAsync(string cacheKey, CancellationToken cancellationToken)
-    {
-        var cachedEntry = await tokenCache.GetAsync(cacheKey, cancellationToken).ConfigureAwait(false);
-        if (cachedEntry is not null)
-        {
-            return cachedEntry.AccessToken;
-        }
-
-        return await TryRefreshInCircuitAsync(cacheKey, cancellationToken).ConfigureAwait(false);
-    }
-
-    private async Task<string?> TryRefreshInCircuitAsync(string cacheKey, CancellationToken cancellationToken)
-    {
-        var refreshToken = await tokenCache.GetRefreshTokenAsync(cacheKey, cancellationToken).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(refreshToken))
-        {
-            return null;
-        }
-
-        return await tokenCache.WithRefreshLockAsync(
-            cacheKey,
-            async lockCt =>
-            {
-                var cached = await tokenCache.GetAsync(cacheKey, lockCt).ConfigureAwait(false);
-                if (cached is not null)
-                {
-                    return cached.AccessToken;
-                }
-
-                var refreshed = await refreshService.RefreshAsync(refreshToken, lockCt).ConfigureAwait(false);
-                if (refreshed is null)
-                {
-                    PublishExpired(cacheKey);
-                    return null;
-                }
-
-                await tokenCache.SetAsync(
-                    cacheKey,
-                    new ServerTokenCacheEntry(refreshed.AccessToken, refreshed.RefreshToken, refreshed.IdToken, refreshed.ExpiresAt),
-                    lockCt).ConfigureAwait(false);
-                return refreshed.AccessToken;
-            },
-            cancellationToken).ConfigureAwait(false);
-    }
+    private Task<string?> TryResolveCachedTokenAsync(string cacheKey, CancellationToken cancellationToken)
+        => userTokenResolver.ResolveAsync(cacheKey, refreshService, PublishExpired, cancellationToken);
 
     private void PublishExpired(string cacheKey)
     {
