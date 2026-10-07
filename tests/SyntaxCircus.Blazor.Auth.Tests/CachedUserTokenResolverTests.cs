@@ -135,4 +135,90 @@ public class CachedUserTokenResolverTests
         tokens.ShouldAllBe(t => t == "refreshed-access");
         handler.CallCount.ShouldBe(1);
     }
+
+    [Fact]
+    public async Task ResolveAsync_RefreshThrowsHttpRequestExceptionInsideSkewWindow_ReturnsStillValidTokenWithoutPublishing()
+    {
+        var cache = new ServerTokenCache();
+        await Seed(cache, "near-expiry-access", "refresh-1", DateTimeOffset.UtcNow.AddSeconds(30));
+        var (refresh, handler) = RefreshServiceFactory.Create(_ => throw new HttpRequestException("idp unreachable"));
+        var published = new List<string>();
+
+        var token = await CreateResolver(cache).ResolveAsync(Key, refresh, published.Add, TestContext.Current.CancellationToken);
+
+        token.ShouldBe("near-expiry-access");
+        handler.CallCount.ShouldBe(1);
+        published.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task ResolveAsync_RefreshTimesOutInsideSkewWindow_ReturnsStillValidTokenWithoutPublishing()
+    {
+        var cache = new ServerTokenCache();
+        await Seed(cache, "near-expiry-access", "refresh-1", DateTimeOffset.UtcNow.AddSeconds(30));
+        var (refresh, _) = RefreshServiceFactory.Create(_ => throw new TaskCanceledException("timeout"));
+        var published = new List<string>();
+
+        var token = await CreateResolver(cache).ResolveAsync(Key, refresh, published.Add, TestContext.Current.CancellationToken);
+
+        token.ShouldBe("near-expiry-access");
+        published.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task ResolveAsync_CallerCancelsDuringRefreshInsideSkewWindow_Rethrows()
+    {
+        var cache = new ServerTokenCache();
+        await Seed(cache, "near-expiry-access", "refresh-1", DateTimeOffset.UtcNow.AddSeconds(30));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var (refresh, _) = RefreshServiceFactory.Create(_ =>
+        {
+            cts.Cancel();
+            throw new OperationCanceledException(cts.Token);
+        });
+
+        await Should.ThrowAsync<OperationCanceledException>(
+            () => CreateResolver(cache).ResolveAsync(Key, refresh, _ => { }, cts.Token));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_RefreshThrowsForReallyExpiredToken_Rethrows()
+    {
+        var cache = new ServerTokenCache();
+        await Seed(cache, "expired-access", "refresh-1", DateTimeOffset.UtcNow.AddMinutes(-10));
+        var (refresh, _) = RefreshServiceFactory.Create(_ => throw new HttpRequestException("idp unreachable"));
+
+        await Should.ThrowAsync<HttpRequestException>(
+            () => CreateResolver(cache).ResolveAsync(Key, refresh, _ => { }, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_CacheReturnsEntryPastExpiryAndRefreshFails_ReturnsNullAndPublishesExpiry()
+    {
+        var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        var cache = new NonFilteringTokenCache(new ServerTokenCacheEntry("stale-access", "refresh-1", null, clock.GetUtcNow().AddMinutes(1)));
+        clock.Advance(TimeSpan.FromMinutes(2));
+        var (refresh, _) = RefreshServiceFactory.Create(_ => new HttpResponseMessage(HttpStatusCode.BadRequest));
+        var published = new List<string>();
+        var resolver = new CachedUserTokenResolver(cache, Options.Create(new AuthOptions()), clock);
+
+        var token = await resolver.ResolveAsync(Key, refresh, published.Add, TestContext.Current.CancellationToken);
+
+        token.ShouldBeNull();
+        published.ShouldBe([Key]);
+    }
+
+    /// <summary>A cache that, unlike the in-process one, hands back entries whatever their expiry.</summary>
+    private sealed class NonFilteringTokenCache(ServerTokenCacheEntry entry) : IServerTokenCache
+    {
+        public Task<ServerTokenCacheEntry?> GetAsync(string cacheKey, CancellationToken cancellationToken = default) => Task.FromResult<ServerTokenCacheEntry?>(entry);
+
+        public Task<string?> GetRefreshTokenAsync(string cacheKey, CancellationToken cancellationToken = default) => Task.FromResult(entry.RefreshToken);
+
+        public Task SetAsync(string cacheKey, ServerTokenCacheEntry value, CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task RemoveAsync(string cacheKey, CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task<T> WithRefreshLockAsync<T>(string cacheKey, Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken = default) => action(cancellationToken);
+    }
 }

@@ -445,12 +445,37 @@ public class ApiAuthHandlerTests
         {
             Content = JsonContent.Create(new { access_token = "refreshed-access", refresh_token = "refresh-2", expires_in = 3600 }),
         });
+        // The skew window comes from the DI path (internal constructor); direct construction uses zero skew.
+        var handler = new ApiAuthHandler(
+            CreateAccessor(null),
+            tokenCache,
+            CreateResolver(tokenCache, refreshService),
+            refreshService,
+            Substitute.For<IApiClientCredentialsTokenProvider>(),
+            NullLogger<ApiAuthHandler>.Instance,
+            new SessionExpiryBroker(),
+            new CachedUserTokenResolver(tokenCache, Options.Create(new AuthOptions { TokenCache = { RefreshSkewSeconds = 60 } })));
+        var inner = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        handler.InnerHandler = inner;
+
+        await Send(handler, cacheKey: "user:user-1");
+
+        inner.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer refreshed-access");
+        refreshHandler.CallCount.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task SendAsync_DirectlyConstructedHandlerNearExpiryToken_ForwardsItWithoutRefreshing()
+    {
+        var tokenCache = new ServerTokenCache();
+        await tokenCache.SetAsync("user:user-1", new ServerTokenCacheEntry("near-expiry-access", "refresh-1", null, DateTimeOffset.UtcNow.AddSeconds(30)), TestContext.Current.CancellationToken);
+        var (refreshService, refreshHandler) = RefreshServiceFactory.Create(_ => new HttpResponseMessage(HttpStatusCode.BadRequest));
         var harness = CreateHandler(null, AuthenticatedPrincipal("user-1"), _ => new HttpResponseMessage(HttpStatusCode.OK), tokenCache, refreshService);
 
         await Send(harness.Handler);
 
-        harness.InnerHandler.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer refreshed-access");
-        refreshHandler.CallCount.ShouldBe(1);
+        harness.InnerHandler.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer near-expiry-access");
+        refreshHandler.CallCount.ShouldBe(0);
     }
 
     [Fact]

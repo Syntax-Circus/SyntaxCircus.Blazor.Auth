@@ -1,3 +1,6 @@
+using System.Text.Json;
+using Microsoft.Extensions.Logging.Abstractions;
+
 namespace SyntaxCircus.Blazor.Auth;
 
 /// <summary>
@@ -16,9 +19,11 @@ namespace SyntaxCircus.Blazor.Auth;
 internal sealed class CachedUserTokenResolver(
     IServerTokenCache tokenCache,
     IOptions<AuthOptions> options,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null,
+    ILogger<CachedUserTokenResolver>? logger = null)
 {
     private readonly TimeProvider clock = timeProvider ?? TimeProvider.System;
+    private readonly ILogger logger = (ILogger?)logger ?? NullLogger.Instance;
 
     /// <summary>
     /// Returns a usable access token for <paramref name="cacheKey"/>, refreshing it if needed, or
@@ -71,7 +76,22 @@ internal sealed class CachedUserTokenResolver(
                     return stillValid;
                 }
 
-                var refreshed = await refreshService.RefreshAsync(refreshToken, lockCt).ConfigureAwait(false);
+                OidcTokenRefreshResult? refreshed;
+                try
+                {
+                    refreshed = await refreshService.RefreshAsync(refreshToken, lockCt).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (
+                    stillValid is not null
+                    && !lockCt.IsCancellationRequested
+                    && !cancellationToken.IsCancellationRequested
+                    && ex is HttpRequestException or OperationCanceledException or JsonException or InvalidOperationException)
+                {
+                    // A transient IdP failure must not turn a token that is still valid into an error.
+                    logger.LogWarning(ex, "Token refresh failed inside the refresh-skew window; using the still-valid cached token.");
+                    return stillValid;
+                }
+
                 if (refreshed is null)
                 {
                     if (stillValid is null)

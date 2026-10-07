@@ -43,7 +43,7 @@ public sealed class ApiAuthHandler : DelegatingHandler
             clientCredentialsTokenProvider,
             logger,
             sessionExpiryBroker,
-            new CachedUserTokenResolver(tokenCache, Options.Create(new AuthOptions())))
+            new CachedUserTokenResolver(tokenCache, Options.Create(new AuthOptions { TokenCache = { RefreshSkewSeconds = 0 } })))
     {
     }
 
