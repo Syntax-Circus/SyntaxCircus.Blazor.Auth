@@ -46,6 +46,7 @@ What each call does:
 - **`AddBlazorTokenForwarding(configuration)`** — registers the token cache (in-process or Redis-backed, see below), the refresh/resolver services, the client-credentials (M2M) fallback provider, and `ApiAuthHandler`.
 - **`UseBlazorTokenCache()`** — middleware that eagerly resolves (and refreshes) the current request's token while response headers are still writable, so a refreshed cookie can actually be persisted. See [How it works](#how-it-works) for why the pipeline position matters.
 - **`.AddHttpMessageHandler<ApiAuthHandler>()`** — attach to any typed `HttpClient` you want the bearer token forwarded to.
+- **`IUserAccessTokenProvider`** — inject it (scoped) wherever you need the signed-in user's current access token as a string, for example a SignalR `HubConnection`. It is registered by `AddBlazorTokenForwarding` (no extra call); see [Using the token outside `HttpClient`](#using-the-token-outside-httpclient).
 
 If your application already keeps its OIDC options under a different configuration section, pass
 that section name as the optional third argument: `services.AddBlazorTokenForwarding(configuration,
@@ -68,6 +69,26 @@ isolated while retaining handler pooling and named-client configuration.
 
 If the current circuit/request is anonymous and `Api:ClientCredentials` is configured (see below), `ApiAuthHandler` falls back to a client-credentials (M2M) token instead of sending the request unauthenticated.
 
+`ApiAuthHandler` and `IUserAccessTokenProvider` share one cache-then-refresh implementation for the circuit case, so a token refreshed by one is immediately visible to the other, and concurrent callers still make a single token-endpoint call. The provider has **no** client-credentials fallback: it only ever returns the signed-in user's token.
+
+## Using the token outside `HttpClient`
+
+Anything that needs the raw bearer token rather than an `HttpClient` pipeline, such as a SignalR `HubConnection`, can inject the scoped `IUserAccessTokenProvider`:
+
+```csharp
+// In a component or scoped service: [Inject] IUserAccessTokenProvider TokenProvider
+var connection = new HubConnectionBuilder()
+    .WithUrl(hubUrl, options =>
+        options.AccessTokenProvider = () => TokenProvider.GetAccessTokenAsync().AsTask())
+    .WithAutomaticReconnect()
+    .Build();
+```
+
+- `GetAccessTokenAsync` returns `null` when the user is anonymous, the session has lapsed, or the identity provider rejected the refresh and the current token has expired. It is **never** a client-credentials token, so treat `null` as "not signed in" rather than sending the request anonymously. When the refresh is rejected and the token has expired, the session is also marked expired (see below), exactly as `ApiAuthHandler` does.
+- It **throws** if a refresh fails transiently (network error, timeout, malformed IdP response, discovery failure) and the token has already expired, and when the caller cancels. In a SignalR `AccessTokenProvider`, an exception makes the connection start or reconnect fail, so catch it if you want to handle that yourself. If the token is still valid when a transient failure happens, it is returned and a warning is logged.
+- It is scoped. Resolve it from the circuit scope and never capture it in a singleton. Outside a circuit scope, where no authentication state exists, it returns `null` instead of throwing.
+- SignalR calls the delegate on every (re)connect, so a long-lived connection picks up a refreshed token each time it reconnects.
+
 ## Session-expiry UX
 
 `SessionStateService` is a scoped service exposing `IsSessionExpired` and an `OnSessionChanged` event. Inject it into a layout or component and subscribe to `OnSessionChanged` to show a "please sign in again" prompt when the current user's session can no longer be refreshed. It's set automatically by `ApiAuthHandler` — see the 401-handling note below for exactly when.
@@ -80,7 +101,7 @@ If the current circuit/request is anonymous and `Api:ClientCredentials` is confi
 | `Authentication:Oidc` | `ClientId` | `""` | required |
 | `Authentication:Oidc` | `ClientSecret` | `""` | required |
 | `Authentication:Oidc` | `Scopes` | `["openid","profile","email","offline_access"]` | keep `offline_access` or refresh tokens won't be issued |
-| `Authentication:Oidc:TokenCache` | `RefreshSkewSeconds` | `60` | how early (before actual expiry) a token is treated as due for refresh |
+| `Authentication:Oidc:TokenCache` | `RefreshSkewSeconds` | `60` | how early (before actual expiry) a token is treated as due for refresh, on both the HTTP-request and circuit paths |
 | `Authentication:Oidc:TokenCache` | `FallbackAccessTokenLifetimeSeconds` | `300` | used only when no expiry can be resolved from the token response or JWT — see the expiry fallback chain below |
 | `Authentication:Oidc:TokenCache:Redis` | `Enabled` | `false` | set `true` to back the token cache with Redis for multi-instance deployments; in-process otherwise |
 | `Authentication:Oidc:TokenCache:Redis` | `ConnectionString` | `""` | required if `Enabled = true` |
@@ -106,6 +127,11 @@ If the current circuit/request is anonymous and `Api:ClientCredentials` is confi
 - **Refresh is single-flight.** Concurrent callers for the same cache key don't trigger duplicate refresh/token-endpoint calls — this applies to both cache implementations and to the client-credentials provider.
 - **401 handling is asymmetric.** A 401 response evicts the cache and marks the session expired (via `SessionStateService`) only when the token came from user OIDC. A 401 on a client-credentials (M2M) token does **not** mark the session expired.
 - **A long-lived Blazor Server circuit re-checks its token instead of reusing the first resolution forever.** `ServerRequestOidcTokenResolver` caches its resolution on `HttpContext.Items` (valid for as long as that resolution's own token is fresh) so a normal HTTP request only resolves once — but for an interactive circuit, `HttpContext` (and therefore `Items`) is ambient for the whole SignalR connection, not one interaction. Once the cached resolution's validity window elapses, the next call re-resolves (and refreshes) rather than replaying the same, now-stale, resolution for the rest of the circuit's lifetime.
+- **The circuit path honors `RefreshSkewSeconds`.** Before this was fixed, a token cached for a SignalR circuit was forwarded until its exact expiry, so a call made just before expiry could reach the API with a token that expired in flight. Now a cached token within `RefreshSkewSeconds` of expiry is refreshed first, the same as on the HTTP-request path. Keep `RefreshSkewSeconds` comfortably below your access-token lifetime, or every call refreshes. This applies to `ApiAuthHandler` and `IUserAccessTokenProvider` alike when registered through DI. An `ApiAuthHandler` you construct directly (without DI) uses a skew of 0, the v0.1.x behaviour.
+- **Transient refresh failures keep a still-valid token.** If a refresh fails with a network error, a timeout, a malformed IdP response or a discovery failure while the current token has not yet expired, that token is forwarded and a warning is logged. This applies on both the circuit path and the HTTP-request path. An expired token, or cancellation by the caller, still throws. A refresh the IdP actively rejects (no new token) is not transient: once the token has expired, the session is marked expired.
+- **While the IdP is down, each call inside the skew window retries the refresh.** Retries are one at a time under the refresh lock, until the token actually expires. This is accepted: the cost is one failing token-endpoint call per request in that window.
+- **Known limitation (HTTP-request path).** The "raced" and "diverged" cache checks in `ServerRequestOidcTokenResolver` use `GetAsync`, which ignores the skew. So while the token cache holds an unexpired entry, the request path does not refresh early; it refreshes only when that token actually expires. The circuit path is not affected.
+- **The refresh token is re-read after the refresh lock is acquired.** A caller waiting for the lock uses the refresh token as of the moment it gets the lock, so it never replays a refresh token another caller has just rotated.
 - **A circuit-path refresh's rotated refresh token is honored on the next HTTP request, even with a stale cookie.** If a SignalR-circuit-path refresh (no `HttpContext`) rotates the refresh token in the server-side cache, the next full HTTP request detects that the cache's refresh token has diverged from the (stale) cookie's and prefers the cache — reusing its access token directly if still valid, or refreshing with the cache's rotated refresh token instead of retrying the cookie's already-invalidated one — and re-signs the cookie to catch it up.
 - **Token expiry resolution fallback chain:** explicit expiry value → `expires_in` from the token response → the JWT `exp` claim → `FallbackAccessTokenLifetimeSeconds`.
 - **Client-credentials failures degrade gracefully.** If the M2M token provider throws, the request goes out unauthenticated (with a logged warning) rather than failing outright.
