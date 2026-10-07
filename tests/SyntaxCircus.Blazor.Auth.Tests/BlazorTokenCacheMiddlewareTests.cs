@@ -11,7 +11,7 @@ public class BlazorTokenCacheMiddlewareTests
             NullLogger<ServerRequestOidcTokenResolver>.Instance);
 
     private static OidcTokenRefreshService CreateNeverCalledRefreshService()
-        => RefreshServiceFactory.Create(_ => throw new InvalidOperationException("Refresh should not have been called.")).Service;
+        => RefreshServiceFactory.Create(_ => throw new NotSupportedException("Refresh should not have been called.")).Service;
 
     private static BlazorTokenCacheMiddleware CreateMiddleware(RequestDelegate next)
         => new(next, NullLogger<BlazorTokenCacheMiddleware>.Instance);

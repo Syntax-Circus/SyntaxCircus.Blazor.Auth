@@ -39,6 +39,8 @@ public static class BlazorTokenForwardingExtensions
         services.AddScoped<IBlazorCircuitHttpClientFactory, BlazorCircuitHttpClientFactory>();
         services.AddSingleton<IUserTokenCacheKeyProvider, UserTokenCacheKeyProvider>();
         services.AddScoped<ServerRequestOidcTokenResolver>();
+        services.AddSingleton<CachedUserTokenResolver>();
+        services.AddScoped<IUserAccessTokenProvider, UserAccessTokenProvider>();
         services.AddTransient<ApiAuthHandler>(sp => new ApiAuthHandler(
             sp.GetRequiredService<IHttpContextAccessor>(),
             sp.GetRequiredService<IServerTokenCache>(),
@@ -46,7 +48,8 @@ public static class BlazorTokenForwardingExtensions
             sp.GetRequiredService<OidcTokenRefreshService>(),
             sp.GetRequiredService<IApiClientCredentialsTokenProvider>(),
             sp.GetRequiredService<ILogger<ApiAuthHandler>>(),
-            sp.GetRequiredService<SessionExpiryBroker>()));
+            sp.GetRequiredService<SessionExpiryBroker>(),
+            sp.GetRequiredService<CachedUserTokenResolver>()));
         services.AddHttpClient<OidcTokenRefreshService>();
 
         services.Configure<AuthOptions>(configuration.GetSection(authSectionName));

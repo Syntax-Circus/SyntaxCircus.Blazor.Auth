@@ -13,7 +13,7 @@ public class ApiAuthHandlerTests
     private static readonly HttpRequestOptionsKey<string> CircuitCacheKey = new("SyntaxCircus.Blazor.Auth.CacheKey");
 
     private static OidcTokenRefreshService CreateNeverCalledRefreshService()
-        => RefreshServiceFactory.Create(_ => throw new InvalidOperationException("Refresh should not have been called.")).Service;
+        => RefreshServiceFactory.Create(_ => throw new NotSupportedException("Refresh should not have been called.")).Service;
 
     private static ServerRequestOidcTokenResolver CreateResolver(IServerTokenCache tokenCache, OidcTokenRefreshService refreshService)
         => new(
@@ -94,7 +94,7 @@ public class ApiAuthHandlerTests
         return invoker.SendAsync(request, TestContext.Current.CancellationToken);
     }
 
-    private static ServiceProvider BuildRegisteredProvider(ClaimsPrincipal principal, HttpMessageHandler? refreshHandler = null, IApiClientCredentialsTokenProvider? clientCredentials = null)
+    private static ServiceProvider BuildRegisteredProvider(ClaimsPrincipal principal, HttpMessageHandler? refreshHandler = null, IApiClientCredentialsTokenProvider? clientCredentials = null, Dictionary<string, string?>? configuration = null)
     {
         var services = new ServiceCollection();
         services.AddLogging();
@@ -102,7 +102,7 @@ public class ApiAuthHandlerTests
         services.Configure<OpenIdConnectOptions>(OpenIdConnectDefaults.AuthenticationScheme, options =>
             options.Configuration = new OpenIdConnectConfiguration { TokenEndpoint = "https://identity.example.com/token" });
         services.AddScoped<AuthenticationStateProvider>(_ => CreateAuthStateProvider(principal));
-        services.AddBlazorTokenForwarding(BuildConfiguration([]));
+        services.AddBlazorTokenForwarding(BuildConfiguration(configuration ?? []));
         if (clientCredentials is not null)
         {
             services.AddSingleton(clientCredentials);
@@ -434,5 +434,136 @@ public class ApiAuthHandlerTests
 
         resolution.Token.ShouldBe("http-path-refreshed-access");
         resolution.IsExpired.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task SendAsync_NoHttpContextCachedTokenInsideRefreshSkewWindow_RefreshesInsteadOfForwardingNearExpiryToken()
+    {
+        var tokenCache = new ServerTokenCache();
+        await tokenCache.SetAsync("user:user-1", new ServerTokenCacheEntry("near-expiry-access", "refresh-1", null, DateTimeOffset.UtcNow.AddSeconds(30)), TestContext.Current.CancellationToken);
+        var (refreshService, refreshHandler) = RefreshServiceFactory.Create(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = JsonContent.Create(new { access_token = "refreshed-access", refresh_token = "refresh-2", expires_in = 3600 }),
+        });
+        // The skew window comes from the DI path (internal constructor); direct construction uses zero skew.
+        var handler = new ApiAuthHandler(
+            CreateAccessor(null),
+            tokenCache,
+            CreateResolver(tokenCache, refreshService),
+            refreshService,
+            Substitute.For<IApiClientCredentialsTokenProvider>(),
+            NullLogger<ApiAuthHandler>.Instance,
+            new SessionExpiryBroker(),
+            new CachedUserTokenResolver(tokenCache, Options.Create(new AuthOptions { TokenCache = { RefreshSkewSeconds = 60 } })));
+        var inner = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        handler.InnerHandler = inner;
+
+        await Send(handler, cacheKey: "user:user-1");
+
+        inner.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer refreshed-access");
+        refreshHandler.CallCount.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task SendAsync_DirectlyConstructedHandlerNearExpiryToken_ForwardsItWithoutRefreshing()
+    {
+        var tokenCache = new ServerTokenCache();
+        await tokenCache.SetAsync("user:user-1", new ServerTokenCacheEntry("near-expiry-access", "refresh-1", null, DateTimeOffset.UtcNow.AddSeconds(30)), TestContext.Current.CancellationToken);
+        var (refreshService, refreshHandler) = RefreshServiceFactory.Create(_ => new HttpResponseMessage(HttpStatusCode.BadRequest));
+        var harness = CreateHandler(null, AuthenticatedPrincipal("user-1"), _ => new HttpResponseMessage(HttpStatusCode.OK), tokenCache, refreshService);
+
+        await Send(harness.Handler);
+
+        harness.InnerHandler.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer near-expiry-access");
+        refreshHandler.CallCount.ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task SendAsync_NoHttpContextNearExpiryTokenWithoutRefreshToken_StillForwardsTheStillValidToken()
+    {
+        var tokenCache = new ServerTokenCache();
+        await tokenCache.SetAsync("user:user-1", new ServerTokenCacheEntry("near-expiry-access", null, null, DateTimeOffset.UtcNow.AddSeconds(30)), TestContext.Current.CancellationToken);
+        var harness = CreateHandler(null, AuthenticatedPrincipal("user-1"), _ => new HttpResponseMessage(HttpStatusCode.OK), tokenCache);
+
+        await Send(harness.Handler);
+
+        harness.InnerHandler.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer near-expiry-access");
+        harness.SessionState.IsSessionExpired.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task SendAsync_NoHttpContextRefreshTokenRotatedWhileWaitingForLock_RefreshesWithTheRotatedToken()
+    {
+        var inner = new ServerTokenCache();
+        await inner.SetAsync("user:user-1", new ServerTokenCacheEntry("expired-access", "refresh-1", null, DateTimeOffset.UtcNow.AddMinutes(-10)), TestContext.Current.CancellationToken);
+        // Simulates another caller that held the lock first: it rotated the refresh token, but its
+        // access token is already expired again by the time this caller gets the lock.
+        var tokenCache = new LockEntryHookTokenCache(inner, () => inner.SetAsync(
+            "user:user-1",
+            new ServerTokenCacheEntry("rotated-expired-access", "refresh-2", null, DateTimeOffset.UtcNow.AddMinutes(-1))));
+        var (refreshService, refreshHandler) = RefreshServiceFactory.Create(request =>
+        {
+            var body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return body.Contains("refresh_token=refresh-2", StringComparison.Ordinal)
+                ? new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(new { access_token = "refreshed-access", refresh_token = "refresh-3", expires_in = 3600 }),
+                }
+                : new HttpResponseMessage(HttpStatusCode.BadRequest);
+        });
+        var harness = CreateHandler(null, AuthenticatedPrincipal("user-1"), _ => new HttpResponseMessage(HttpStatusCode.OK), tokenCache, refreshService);
+
+        await Send(harness.Handler);
+
+        harness.InnerHandler.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer refreshed-access");
+        refreshHandler.CallCount.ShouldBe(1);
+        harness.SessionState.IsSessionExpired.ShouldBeFalse();
+    }
+
+    /// <summary>Runs a hook as the refresh lock is entered, to simulate another caller changing the cache first.</summary>
+    private sealed class LockEntryHookTokenCache(IServerTokenCache inner, Func<Task> onLockEntered) : IServerTokenCache
+    {
+        public Task<ServerTokenCacheEntry?> GetAsync(string cacheKey, CancellationToken cancellationToken = default) => inner.GetAsync(cacheKey, cancellationToken);
+
+        public Task<string?> GetRefreshTokenAsync(string cacheKey, CancellationToken cancellationToken = default) => inner.GetRefreshTokenAsync(cacheKey, cancellationToken);
+
+        public Task SetAsync(string cacheKey, ServerTokenCacheEntry entry, CancellationToken cancellationToken = default) => inner.SetAsync(cacheKey, entry, cancellationToken);
+
+        public Task RemoveAsync(string cacheKey, CancellationToken cancellationToken = default) => inner.RemoveAsync(cacheKey, cancellationToken);
+
+        public Task<T> WithRefreshLockAsync<T>(string cacheKey, Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken = default)
+            => inner.WithRefreshLockAsync(
+                cacheKey,
+                async ct =>
+                {
+                    await onLockEntered().ConfigureAwait(false);
+                    return await action(ct).ConfigureAwait(false);
+                },
+                cancellationToken);
+    }
+
+    [Fact]
+    public async Task RegisteredHandler_UsesConfiguredRefreshSkew()
+    {
+        var refreshHandler = new StubHttpMessageHandler(_ => throw new NotSupportedException("Refresh should not have been called."));
+        using var provider = BuildRegisteredProvider(
+            AuthenticatedPrincipal("user-1"),
+            refreshHandler,
+            configuration: new Dictionary<string, string?> { ["Authentication:Oidc:TokenCache:RefreshSkewSeconds"] = "0" });
+        await provider.GetRequiredService<IServerTokenCache>().SetAsync(
+            "user:user-1",
+            new ServerTokenCacheEntry("near-expiry-access", "refresh-1", null, DateTimeOffset.UtcNow.AddSeconds(30)),
+            TestContext.Current.CancellationToken);
+
+        using var handlerScope = provider.CreateScope();
+        handlerScope.ServiceProvider.GetRequiredService<IHttpContextAccessor>().HttpContext = null;
+        var handler = handlerScope.ServiceProvider.GetRequiredService<ApiAuthHandler>();
+        var inner = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        handler.InnerHandler = inner;
+
+        await Send(handler, cacheKey: "user:user-1");
+
+        inner.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer near-expiry-access");
+        refreshHandler.CallCount.ShouldBe(0);
     }
 }

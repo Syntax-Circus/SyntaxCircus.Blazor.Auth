@@ -10,13 +10,16 @@ This is a small NuGet library, not an application. "Done" means: it builds clean
 src/SyntaxCircus.Blazor.Auth/
   BlazorTokenForwardingExtensions.cs   — the two DI/pipeline entry points (AddBlazorTokenForwarding, UseBlazorTokenCache)
   ApiAuthHandler.cs                    — DelegatingHandler; dual-mode (HttpContext request vs. SignalR circuit)
+  CachedUserTokenResolver.cs           — internal singleton; the one cache-then-refresh-under-lock implementation for the circuit path, shared by ApiAuthHandler and UserAccessTokenProvider
+  TransientRefreshFailure.cs           — internal filter (network/timeout/malformed/discovery) shared by the circuit and request paths
   BlazorTokenCacheMiddleware.cs        — eager per-request token resolution
   ServerRequestOidcTokenResolver.cs
   ServerRequestOidcTokenResolution.cs
   SessionStateService.cs               — scoped UI signal (IsSessionExpired / OnSessionChanged)
   Caching/                             — IServerTokenCache + ServerTokenCache (in-process) + RedisServerTokenCache
   Tokens/                              — OidcTokenRefreshService, OidcTokenExpiry, IApiClientCredentialsTokenProvider,
-                                          ApiClientCredentialsTokenProvider, IUserTokenCacheKeyProvider, UserTokenCacheKeyProvider
+                                          ApiClientCredentialsTokenProvider, IUserTokenCacheKeyProvider, UserTokenCacheKeyProvider,
+                                          IUserAccessTokenProvider (public) + UserAccessTokenProvider (internal, scoped; user token only, no M2M fallback)
   Options/                             — AuthOptions, ApiOptions, ApiClientCredentialsOptions
   Diagnostics/                         — namespace SyntaxCircus.Blazor.Auth.Diagnostics; AuthDebugEndpoints (opt-in)
 
@@ -60,6 +63,10 @@ tests/SyntaxCircus.Blazor.Auth.Tests/
 
 - **`UseBlazorTokenCache()` ordering is load-bearing.** It must run between `UseAuthorization()` and `UseAntiforgery()` — that's the window where response headers are still writable, needed to persist a refreshed cookie. If you touch `BlazorTokenCacheMiddleware`, don't assume the ordering requirement is arbitrary.
 - **`ApiAuthHandler` has two structurally different code paths** gated on `httpContextAccessor.HttpContext is not null` (normal request vs. SignalR circuit). A fix that only touches one path usually needs a mirrored fix in the other — check `ApiAuthHandlerTests` for paired tests (request-mode and circuit-mode variants of the same behavior) before assuming single-path coverage is enough.
+- **Circuit-path token logic lives only in `CachedUserTokenResolver`.** Both `ApiAuthHandler` and `UserAccessTokenProvider` call it; a fix to cache-then-refresh, skew or lock behavior goes there, not in either caller. It is a singleton, so it must not take scoped or typed-`HttpClient` dependencies (`OidcTokenRefreshService` and the expiry publisher are passed per call). The two public `ApiAuthHandler` constructors build their own instance with default `AuthOptions` (refresh skew 0, the v0.1.x behaviour); the internal constructor (used by the DI registration) takes the shared one so the configured `RefreshSkewSeconds` applies.
+- **Transient refresh failures are filtered by `TransientRefreshFailure.Is`, on both paths.** The circuit path (`CachedUserTokenResolver`) and the request path (`ServerRequestOidcTokenResolver`) keep a still-valid token and log a warning when a refresh fails that way; an expired token or caller cancellation still throws. Change the filter in that one place, not per path.
+- **Known limitation, pre-existing:** on the request path the "raced" and "diverged" cache checks use `GetAsync`, which ignores the skew, so the request path does not refresh early while the cache holds an unexpired entry. Don't assume the skew applies there.
+- **`IUserAccessTokenProvider` is the only new public type; keep it that way.** It is scoped, never resolve it from the root provider or capture it in a singleton, and it must never fall back to client credentials. It returns `null` for anonymous, lapsed, rejected-and-expired, or outside a circuit scope, and throws on transient failure with an expired token and on cancellation. `PublicSurface_ExposesOnlyTheProviderInterface` guards the accessibility of the implementation types.
 - **The `TokenSource` enum in `ApiAuthHandler`** gates the "only user-OIDC 401 marks the session expired" contract — see Safe extension points above before adding a new source.
 - **`AuthOptions` is read two different ways** in `AddBlazorTokenForwarding` (`IOptions<AuthOptions>` binding, plus one eager `Get<AuthOptions>()` call used only to decide Redis-vs-in-process cache registration). If you change `AuthOptions`'s shape, keep both call sites consistent.
 - **`ApiOptions` is bound but not consumed internally.** This is documented as intentional (host-app convenience) in the README — don't "fix" it as a bug without raising it as its own decision first.
