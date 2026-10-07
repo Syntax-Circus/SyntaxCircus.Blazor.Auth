@@ -409,6 +409,17 @@ public class UserAccessTokenProviderTests
     }
 
     [Fact]
+    public void Registered_CachedUserTokenResolverGetsARealLogger()
+    {
+        using var provider = BuildRegistered(Authenticated());
+        var resolver = provider.GetRequiredService<CachedUserTokenResolver>();
+
+        var field = typeof(CachedUserTokenResolver).GetField("logger", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        field.ShouldNotBeNull();
+        field.GetValue(resolver).ShouldNotBeOfType<NullLogger>();
+    }
+
+    [Fact]
     public void PublicSurface_ExposesOnlyTheProviderInterface()
     {
         var exported = typeof(IUserAccessTokenProvider).Assembly.GetExportedTypes().Select(t => t.Name).ToList();

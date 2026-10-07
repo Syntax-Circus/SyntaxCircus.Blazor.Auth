@@ -40,7 +40,7 @@ public class ServerRequestOidcTokenResolverTests
     }
 
     private static OidcTokenRefreshService CreateNeverCalledRefreshService()
-        => RefreshServiceFactory.Create(_ => throw new InvalidOperationException("Refresh should not have been called.")).Service;
+        => RefreshServiceFactory.Create(_ => throw new NotSupportedException("Refresh should not have been called.")).Service;
 
     [Fact]
     public async Task ResolveAsync_NullHttpContext_ThrowsArgumentNullException()

@@ -1,4 +1,3 @@
-using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SyntaxCircus.Blazor.Auth;
@@ -82,7 +81,8 @@ internal sealed class CachedUserTokenResolver(
                     refreshed = await refreshService.RefreshAsync(refreshToken, lockCt).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (
-                    stillValid is not null
+                    // Re-check validity now: a slow IdP can fail after the token expired in the meantime.
+                    (stillValid = StillValidToken(cached, clock.GetUtcNow())) is not null
                     && !lockCt.IsCancellationRequested
                     && !cancellationToken.IsCancellationRequested
                     && TransientRefreshFailure.Is(ex))
@@ -94,6 +94,8 @@ internal sealed class CachedUserTokenResolver(
 
                 if (refreshed is null)
                 {
+                    // Re-check validity: a slow rejection may have outlived the token.
+                    stillValid = StillValidToken(cached, clock.GetUtcNow());
                     if (stillValid is null)
                     {
                         onExpired(cacheKey);

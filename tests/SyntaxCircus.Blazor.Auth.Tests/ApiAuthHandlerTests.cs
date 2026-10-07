@@ -13,7 +13,7 @@ public class ApiAuthHandlerTests
     private static readonly HttpRequestOptionsKey<string> CircuitCacheKey = new("SyntaxCircus.Blazor.Auth.CacheKey");
 
     private static OidcTokenRefreshService CreateNeverCalledRefreshService()
-        => RefreshServiceFactory.Create(_ => throw new InvalidOperationException("Refresh should not have been called.")).Service;
+        => RefreshServiceFactory.Create(_ => throw new NotSupportedException("Refresh should not have been called.")).Service;
 
     private static ServerRequestOidcTokenResolver CreateResolver(IServerTokenCache tokenCache, OidcTokenRefreshService refreshService)
         => new(
@@ -545,7 +545,7 @@ public class ApiAuthHandlerTests
     [Fact]
     public async Task RegisteredHandler_UsesConfiguredRefreshSkew()
     {
-        var refreshHandler = new StubHttpMessageHandler(_ => throw new InvalidOperationException("Refresh should not have been called."));
+        var refreshHandler = new StubHttpMessageHandler(_ => throw new NotSupportedException("Refresh should not have been called."));
         using var provider = BuildRegisteredProvider(
             AuthenticatedPrincipal("user-1"),
             refreshHandler,

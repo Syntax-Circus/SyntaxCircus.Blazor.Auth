@@ -12,8 +12,20 @@ public class CachedUserTokenResolverTests
             Content = JsonContent.Create(new { access_token = accessToken, refresh_token = refreshToken, expires_in = 3600 }),
         };
 
-    private static CachedUserTokenResolver CreateResolver(ServerTokenCache cache, TimeProvider? clock = null, int skewSeconds = 60)
-        => new(cache, Options.Create(new AuthOptions { TokenCache = { RefreshSkewSeconds = skewSeconds } }), clock);
+    private static CachedUserTokenResolver CreateResolver(ServerTokenCache cache, TimeProvider? clock = null, int skewSeconds = 60, ILogger<CachedUserTokenResolver>? logger = null)
+        => new(cache, Options.Create(new AuthOptions { TokenCache = { RefreshSkewSeconds = skewSeconds } }), clock, logger);
+
+    private sealed class CapturingLogger : ILogger<CachedUserTokenResolver>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            => Entries.Add((logLevel, formatter(state, exception)));
+    }
 
     private static Task Seed(ServerTokenCache cache, string access, string? refresh, DateTimeOffset expiresAt)
         => cache.SetAsync(Key, new ServerTokenCacheEntry(access, refresh, null, expiresAt), TestContext.Current.CancellationToken);
@@ -163,6 +175,57 @@ public class CachedUserTokenResolverTests
 
         token.ShouldBe("near-expiry-access");
         published.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task ResolveAsync_RefreshFailsTransientlyAfterTokenExpiredDuringIt_Throws()
+    {
+        var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        var cache = new ServerTokenCache();
+        await Seed(cache, "near-expiry-access", "refresh-1", clock.GetUtcNow().AddSeconds(30));
+        var (refresh, _) = RefreshServiceFactory.Create(_ =>
+        {
+            clock.Advance(TimeSpan.FromSeconds(100));
+            throw new HttpRequestException("idp slow then down");
+        });
+        var published = new List<string>();
+
+        await Should.ThrowAsync<HttpRequestException>(
+            () => CreateResolver(cache, clock).ResolveAsync(Key, refresh, published.Add, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_RefreshRejectedAfterTokenExpiredDuringIt_ReturnsNullAndPublishesExpiry()
+    {
+        var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        var cache = new ServerTokenCache();
+        await Seed(cache, "near-expiry-access", "refresh-1", clock.GetUtcNow().AddSeconds(30));
+        var (refresh, _) = RefreshServiceFactory.Create(_ =>
+        {
+            clock.Advance(TimeSpan.FromSeconds(100));
+            return new HttpResponseMessage(HttpStatusCode.BadRequest);
+        });
+        var published = new List<string>();
+
+        var token = await CreateResolver(cache, clock).ResolveAsync(Key, refresh, published.Add, TestContext.Current.CancellationToken);
+
+        token.ShouldBeNull();
+        published.ShouldBe([Key]);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_TransientFailureInsideSkewWindow_LogsWarningWithoutTheToken()
+    {
+        var cache = new ServerTokenCache();
+        await Seed(cache, "near-expiry-secret-access", "refresh-secret-1", DateTimeOffset.UtcNow.AddSeconds(30));
+        var (refresh, _) = RefreshServiceFactory.Create(_ => throw new HttpRequestException("idp down"));
+        var log = new CapturingLogger();
+
+        await CreateResolver(cache, logger: log).ResolveAsync(Key, refresh, _ => { }, TestContext.Current.CancellationToken);
+
+        var warning = log.Entries.ShouldHaveSingleItem();
+        warning.Level.ShouldBe(LogLevel.Warning);
+        warning.Message.ShouldNotContain("secret");
     }
 
     [Fact]
