@@ -209,7 +209,7 @@ public sealed class ServerRequestOidcTokenResolver(
         catch (Exception ex) when (
             currentExpiry > clock.GetUtcNow()
             && !cancellationToken.IsCancellationRequested
-            && ex is HttpRequestException or OperationCanceledException or System.Text.Json.JsonException or InvalidOperationException)
+            && TransientRefreshFailure.Is(ex))
         {
             // A transient IdP failure must not turn a token that is still valid into an error.
             // Nothing is persisted and no expiry is signalled; the next call retries the refresh.

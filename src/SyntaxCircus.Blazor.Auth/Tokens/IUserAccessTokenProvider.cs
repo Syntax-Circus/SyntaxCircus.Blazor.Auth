@@ -9,7 +9,7 @@ namespace SyntaxCircus.Blazor.Auth;
 /// <remarks>
 /// <para>
 /// <b>Null result.</b> <see langword="null"/> means the user is anonymous, the session has lapsed
-/// (no usable token and nothing to refresh from), or the identity provider rejected the refresh. It is never a
+/// (no usable token and nothing to refresh from), or the identity provider rejected the refresh and the current token has expired. It is never a
 /// client-credentials (machine-to-machine) token: this provider acts only as the signed-in user, so
 /// callers must treat <see langword="null"/> as "not authenticated" and not as "send anonymously".
 /// </para>

@@ -85,7 +85,7 @@ internal sealed class CachedUserTokenResolver(
                     stillValid is not null
                     && !lockCt.IsCancellationRequested
                     && !cancellationToken.IsCancellationRequested
-                    && ex is HttpRequestException or OperationCanceledException or JsonException or InvalidOperationException)
+                    && TransientRefreshFailure.Is(ex))
                 {
                     // A transient IdP failure must not turn a token that is still valid into an error.
                     logger.LogWarning(ex, "Token refresh failed inside the refresh-skew window; using the still-valid cached token.");

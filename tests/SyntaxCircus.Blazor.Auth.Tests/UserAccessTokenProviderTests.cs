@@ -323,6 +323,30 @@ public class UserAccessTokenProviderTests
         await Should.ThrowAsync<ArgumentException>(async () => await h.Provider.GetAccessTokenAsync(TestContext.Current.CancellationToken));
     }
 
+    [Fact]
+    public async Task GetAccessTokenAsync_HttpContextRefreshTimesOutInsideSkewWindow_ReturnsStillValidToken()
+    {
+        var (context, _) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "near-expiry-access",
+            ["refresh_token"] = "refresh-1",
+            ["expires_at"] = Iso(DateTimeOffset.UtcNow.AddSeconds(30)),
+        });
+        var h = Create(context, Authenticated(), _ => throw new TaskCanceledException("timeout"));
+
+        (await h.Provider.GetAccessTokenAsync(TestContext.Current.CancellationToken)).ShouldBe("near-expiry-access");
+        h.SessionState.IsSessionExpired.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task GetAccessTokenAsync_NoHttpContextUnexpectedExceptionInsideSkewWindow_Rethrows()
+    {
+        var h = Create(null, Authenticated(), _ => throw new ArgumentException("programming error"));
+        await Seed(h.Cache, "near-expiry-access", "refresh-1", DateTimeOffset.UtcNow.AddSeconds(30));
+
+        await Should.ThrowAsync<ArgumentException>(async () => await h.Provider.GetAccessTokenAsync(TestContext.Current.CancellationToken));
+    }
+
     // ---- registration ----
 
     private static ServiceProvider BuildRegistered(ClaimsPrincipal principal, IApiClientCredentialsTokenProvider? clientCredentials = null)
