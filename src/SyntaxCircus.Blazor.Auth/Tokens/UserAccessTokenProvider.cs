@@ -34,7 +34,7 @@ internal sealed class UserAccessTokenProvider(
         catch (InvalidOperationException ex)
         {
             // Thrown when resolved outside a circuit scope: there is no user to act as.
-            logger.LogWarning(ex, "Failed to resolve authentication state; no user access token is available.");
+            logger.LogDebug(ex, "Failed to resolve authentication state; no user access token is available.");
             return null;
         }
 

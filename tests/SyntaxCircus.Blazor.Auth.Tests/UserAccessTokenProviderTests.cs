@@ -35,12 +35,15 @@ public class UserAccessTokenProviderTests
         ClaimsPrincipal principal,
         Func<HttpRequestMessage, HttpResponseMessage>? refreshResponder = null,
         TimeProvider? clock = null,
-        AuthenticationStateProvider? stateProvider = null)
+        AuthenticationStateProvider? stateProvider = null,
+        IUserTokenCacheKeyProvider? keyProviderOverride = null,
+        ILogger<ServerRequestOidcTokenResolver>? resolverLogger = null)
     {
         var cache = new ServerTokenCache();
         var (refresh, refreshHandler) = RefreshServiceFactory.Create(refreshResponder ?? (_ => Refreshed()));
         var authOptions = Options.Create(new AuthOptions());
         var keyProvider = new UserTokenCacheKeyProvider();
+        var providerKeys = keyProviderOverride ?? keyProvider;
         var broker = new SessionExpiryBroker();
         var state = new SessionStateService(broker);
         state.Observe(Key);
@@ -49,14 +52,26 @@ public class UserAccessTokenProviderTests
 
         var provider = new UserAccessTokenProvider(
             accessor,
-            new ServerRequestOidcTokenResolver(cache, refresh, keyProvider, authOptions, NullLogger<ServerRequestOidcTokenResolver>.Instance, clock),
+            new ServerRequestOidcTokenResolver(cache, refresh, keyProvider, authOptions, resolverLogger ?? NullLogger<ServerRequestOidcTokenResolver>.Instance, clock),
             stateProvider ?? StateProvider(principal),
-            keyProvider,
+            providerKeys,
             new CachedUserTokenResolver(cache, authOptions, clock),
             refresh,
             broker,
             NullLogger<UserAccessTokenProvider>.Instance);
         return new Harness(provider, cache, refreshHandler, state);
+    }
+
+    private sealed class CapturingLogger : ILogger<ServerRequestOidcTokenResolver>
+    {
+        public List<LogLevel> Levels { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            => Levels.Add(logLevel);
     }
 
     private static Task Seed(ServerTokenCache cache, string access, string? refresh, DateTimeOffset expiresAt)
@@ -218,6 +233,94 @@ public class UserAccessTokenProviderTests
         var h = Create(context, Anonymous());
 
         (await h.Provider.GetAccessTokenAsync(TestContext.Current.CancellationToken)).ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task GetAccessTokenAsync_NoHttpContextExpiredEntryRefreshThrowsInvalidOperation_Rethrows()
+    {
+        var h = Create(null, Authenticated(), _ => throw new InvalidOperationException("discovery failed"));
+        await Seed(h.Cache, "expired-access", "refresh-1", DateTimeOffset.UtcNow.AddMinutes(-10));
+
+        await Should.ThrowAsync<InvalidOperationException>(async () => await h.Provider.GetAccessTokenAsync(TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task GetAccessTokenAsync_NoHttpContextUnauthenticatedWithPermissiveKeyProvider_ReturnsNull()
+    {
+        var keys = Substitute.For<IUserTokenCacheKeyProvider>();
+        keys.GetCacheKey(Arg.Any<ClaimsPrincipal?>()).Returns(Key);
+        var h = Create(null, Anonymous(), keyProviderOverride: keys);
+        await Seed(h.Cache, "someone-elses-access", "refresh-1", DateTimeOffset.UtcNow.AddHours(1));
+
+        (await h.Provider.GetAccessTokenAsync(TestContext.Current.CancellationToken)).ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task GetAccessTokenAsync_HttpContextTransientRefreshFailureInsideSkewWindow_ReturnsStillValidTokenWithoutExpiry()
+    {
+        var (context, _) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "near-expiry-access",
+            ["refresh_token"] = "refresh-1",
+            ["expires_at"] = Iso(DateTimeOffset.UtcNow.AddSeconds(30)),
+        });
+        var log = new CapturingLogger();
+        var h = Create(context, Authenticated(), _ => throw new HttpRequestException("idp down"), resolverLogger: log);
+
+        (await h.Provider.GetAccessTokenAsync(TestContext.Current.CancellationToken)).ShouldBe("near-expiry-access");
+        log.Levels.ShouldContain(LogLevel.Warning);
+
+        h.RefreshHandler.CallCount.ShouldBe(1);
+        h.SessionState.IsSessionExpired.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task GetAccessTokenAsync_HttpContextExpiredTokenRefreshThrows_Rethrows()
+    {
+        var (context, _) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "expired-access",
+            ["refresh_token"] = "refresh-1",
+            ["expires_at"] = Iso(DateTimeOffset.UtcNow.AddMinutes(-5)),
+        });
+        var h = Create(context, Authenticated(), _ => throw new HttpRequestException("idp down"));
+
+        await Should.ThrowAsync<HttpRequestException>(async () => await h.Provider.GetAccessTokenAsync(TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task GetAccessTokenAsync_HttpContextCallerCancelsDuringRefreshInsideSkewWindow_Rethrows()
+    {
+        var (context, _) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "near-expiry-access",
+            ["refresh_token"] = "refresh-1",
+            ["expires_at"] = Iso(DateTimeOffset.UtcNow.AddSeconds(30)),
+        });
+        using var cts = new CancellationTokenSource();
+        var log = new CapturingLogger();
+        var h = Create(context, Authenticated(), _ =>
+        {
+            cts.Cancel();
+            throw new OperationCanceledException(cts.Token);
+        }, resolverLogger: log);
+
+        await Should.ThrowAsync<OperationCanceledException>(async () => await h.Provider.GetAccessTokenAsync(cts.Token));
+        log.Levels.ShouldNotContain(LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task GetAccessTokenAsync_HttpContextUnexpectedExceptionInsideSkewWindow_Rethrows()
+    {
+        var (context, _) = FakeAuthenticationContext.CreateAuthenticated("user-1", new Dictionary<string, string>
+        {
+            ["access_token"] = "near-expiry-access",
+            ["refresh_token"] = "refresh-1",
+            ["expires_at"] = Iso(DateTimeOffset.UtcNow.AddSeconds(30)),
+        });
+        var h = Create(context, Authenticated(), _ => throw new ArgumentException("programming error"));
+
+        await Should.ThrowAsync<ArgumentException>(async () => await h.Provider.GetAccessTokenAsync(TestContext.Current.CancellationToken));
     }
 
     // ---- registration ----

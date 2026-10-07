@@ -9,9 +9,16 @@ namespace SyntaxCircus.Blazor.Auth;
 /// <remarks>
 /// <para>
 /// <b>Null result.</b> <see langword="null"/> means the user is anonymous, the session has lapsed
-/// (no usable token and nothing to refresh from), or the refresh failed. It is never a
+/// (no usable token and nothing to refresh from), or the identity provider rejected the refresh. It is never a
 /// client-credentials (machine-to-machine) token: this provider acts only as the signed-in user, so
 /// callers must treat <see langword="null"/> as "not authenticated" and not as "send anonymously".
+/// </para>
+/// <para>
+/// <b>Transient refresh failures.</b> If a refresh fails transiently (network error, timeout, a bad
+/// identity-provider response or a discovery failure) while the current token is still valid, that
+/// still-valid token is returned. If the token has already expired, or the caller cancels, the call
+/// throws instead of returning <see langword="null"/>. A SignalR <c>AccessTokenProvider</c> that
+/// throws makes the connection start or reconnect fail, so callers may want to catch.
 /// </para>
 /// <para>
 /// <b>Scope.</b> Registered as a scoped service by <c>AddBlazorTokenForwarding</c>. Resolve it from

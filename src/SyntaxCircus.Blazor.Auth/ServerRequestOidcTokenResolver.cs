@@ -201,7 +201,22 @@ public sealed class ServerRequestOidcTokenResolver(
             return new ServerRequestOidcTokenResolution(raced.AccessToken, subject, cacheKey, false);
         }
 
-        var refreshed = await refreshService.RefreshAsync(refreshToken, cancellationToken).ConfigureAwait(false);
+        OidcTokenRefreshResult? refreshed;
+        try
+        {
+            refreshed = await refreshService.RefreshAsync(refreshToken, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (
+            currentExpiry > clock.GetUtcNow()
+            && !cancellationToken.IsCancellationRequested
+            && ex is HttpRequestException or OperationCanceledException or System.Text.Json.JsonException or InvalidOperationException)
+        {
+            // A transient IdP failure must not turn a token that is still valid into an error.
+            // Nothing is persisted and no expiry is signalled; the next call retries the refresh.
+            logger.LogWarning(ex, "OIDC token refresh failed inside the refresh-skew window for cache key '{CacheKey}'; using the still-valid token.", cacheKey);
+            return new ServerRequestOidcTokenResolution(currentAccessToken, subject, cacheKey, false);
+        }
+
         if (refreshed is null)
         {
             logger.LogWarning("OIDC token refresh failed for cache key '{CacheKey}'.", cacheKey);
