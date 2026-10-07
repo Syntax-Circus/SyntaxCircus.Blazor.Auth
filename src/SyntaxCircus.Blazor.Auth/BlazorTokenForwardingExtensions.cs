@@ -40,6 +40,7 @@ public static class BlazorTokenForwardingExtensions
         services.AddSingleton<IUserTokenCacheKeyProvider, UserTokenCacheKeyProvider>();
         services.AddScoped<ServerRequestOidcTokenResolver>();
         services.AddSingleton<CachedUserTokenResolver>();
+        services.AddScoped<IUserAccessTokenProvider, UserAccessTokenProvider>();
         services.AddTransient<ApiAuthHandler>(sp => new ApiAuthHandler(
             sp.GetRequiredService<IHttpContextAccessor>(),
             sp.GetRequiredService<IServerTokenCache>(),
