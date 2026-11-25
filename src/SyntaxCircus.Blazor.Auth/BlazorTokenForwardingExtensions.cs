@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Components.Authorization;
 using Microsoft.Extensions.Caching.Distributed;
@@ -33,6 +34,9 @@ public static class BlazorTokenForwardingExtensions
         ArgumentException.ThrowIfNullOrWhiteSpace(authSectionName);
 
         services.AddHttpContextAccessor();
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IPostConfigureOptions<CookieAuthenticationOptions>, SessionIdCookiePostConfigureOptions>());
+        services.TryAddTransient(typeof(SessionIdCookieEvents<>));
         services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<SessionExpiryBroker>();
         services.AddScoped<SessionStateService>();

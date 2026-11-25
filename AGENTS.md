@@ -15,8 +15,12 @@ src/SyntaxCircus.Blazor.Auth/
   BlazorTokenCacheMiddleware.cs        — eager per-request token resolution
   ServerRequestOidcTokenResolver.cs
   ServerRequestOidcTokenResolution.cs
+  SessionId.cs                         — internal: the per-sign-in session id claim
+  SessionIdCookiePostConfigureOptions.cs, SessionIdCookieHook.cs — internal: attach that claim through the cookie events
+  CookieRead.cs                        — internal: what this request read from a cookie; the only evidence that a sign-in continues its session
+  TokenRefreshSignIn.cs                — internal marker: the resolver's own cookie re-sign (never mints a session id)
   SessionStateService.cs               — scoped UI signal (IsSessionExpired / OnSessionChanged)
-  Caching/                             — IServerTokenCache + ServerTokenCache (in-process) + RedisServerTokenCache
+  Caching/                             — IServerTokenCache + ServerTokenCache (in-process) + RedisServerTokenCache + KeyedRefreshLock (internal)
   Tokens/                              — OidcTokenRefreshService, OidcTokenExpiry, IApiClientCredentialsTokenProvider,
                                           ApiClientCredentialsTokenProvider, IUserTokenCacheKeyProvider, UserTokenCacheKeyProvider,
                                           IUserAccessTokenProvider (public) + UserAccessTokenProvider (internal, scoped; user token only, no M2M fallback)
@@ -57,6 +61,7 @@ tests/SyntaxCircus.Blazor.Auth.Tests/
   - `StubHttpMessageHandler(responder)` — fake `HttpMessageHandler`; exposes `LastRequest` (method/URI/headers/body) and `CallCount` for asserting on outgoing calls.
   - `TestAuthHandler` — header-driven auth handler (`X-Test-Authenticated: true`, `X-Test-Token-{name}`) for `TestServer`-backed integration tests.
   - `TestServerFactory.Create(configureServices?, configureApp)` — spins up an in-memory `TestServer` for exercising middleware/endpoints for real.
+  - `CookieSessionHost.Create(configureBefore?, configureAfter?, addDefaultCookie?)` — a `TestServer` with the real cookie handler, `AddBlazorTokenForwarding` and a fake rotating identity provider; its `Browser` is one cookie jar.
 - NCrunch: `.ncrunchsolution`/`.ncrunchproject` are checked into this branch. See the xunit.v3 pin above for why it's load-bearing — don't bump that package without checking NCrunch compatibility first.
 
 ## Gotchas
@@ -67,6 +72,12 @@ tests/SyntaxCircus.Blazor.Auth.Tests/
 - **Transient refresh failures are filtered by `TransientRefreshFailure.Is`, on both paths.** The circuit path (`CachedUserTokenResolver`) and the request path (`ServerRequestOidcTokenResolver`) keep a still-valid token and log a warning when a refresh fails that way; an expired token or caller cancellation still throws. Change the filter in that one place, not per path.
 - **Known limitation, pre-existing:** on the request path the "raced" and "diverged" cache checks use `GetAsync`, which ignores the skew, so the request path does not refresh early while the cache holds an unexpired entry. Don't assume the skew applies there.
 - **`IUserAccessTokenProvider` is the only new public type; keep it that way.** It is scoped, never resolve it from the root provider or capture it in a singleton, and it must never fall back to client credentials. It returns `null` for anonymous, lapsed, rejected-and-expired, or outside a circuit scope, and throws on transient failure with an expired token and on cancellation. `PublicSurface_ExposesOnlyTheProviderInterface` guards the accessibility of the implementation types.
+- **Cache keys are per sign-in session.** Resolve a signed-in user's key only with `IUserTokenCacheKeyProvider.GetCacheKey(principal)`; the `subject` overload is the per-user key for sessions without an id. Never fall back from a session key to the per-user key or another session's entry. A session id counts only with the package's claim issuer (see `SessionId`).
+- **Session ids are minted on new sign-ins only.** A re-sign that continues a cookie's session keeps what the cookie had, including no id: that covers the resolver's own re-sign after a token refresh (`TokenRefreshSignIn`) and a host re-sign proven by `CookieRead`. A pre-upgrade cookie moved to a new key would diverge from circuits still on the old one and replay rotated refresh tokens. A new cookie re-sign inside the package must run under that marker. With or without an id, a sign-in removes any session-id claim that is not ours.
+- **Never carry a session id over on the strength of `AuthenticationProperties.Items`.** Items travel in the OpenID Connect `state`, so a new identity-provider sign-in can arrive with an old record. A sign-in without an id claim continues a session (with its id, or without one) only through `CookieRead` (same request, same scheme, same `Items` dictionary the handler read, same subject). The one exception is the package's own marked refresh re-sign. Prove changes here against the real OpenID Connect handler (`Infrastructure/FakeOpenIdProvider`).
+- **Any cookie event the hook wraps must also be in `OverridesWrappedEvent`**, or a subclass override bypasses it.
+- **Test cookie behaviour through the real handler** (`Infrastructure/CookieSessionHost`). `FakeAuthenticationContext` substitutes `IAuthenticationService`, so no cookie events run. When upgrading ASP.NET Core, `ForwardedEvents_PassEveryCookieEventThroughToTheOriginalInstance` guards against new cookie events that `SessionIdCookiePostConfigureOptions.Forward` would drop.
+- **Caches must stay bounded.** Keys grow with sign-ins: take refresh locks through `KeyedRefreshLock` (never a permanent per-key dictionary), and keep both caches' retention at access-token expiry + 30 days.
 - **The `TokenSource` enum in `ApiAuthHandler`** gates the "only user-OIDC 401 marks the session expired" contract — see Safe extension points above before adding a new source.
 - **`AuthOptions` is read two different ways** in `AddBlazorTokenForwarding` (`IOptions<AuthOptions>` binding, plus one eager `Get<AuthOptions>()` call used only to decide Redis-vs-in-process cache registration). If you change `AuthOptions`'s shape, keep both call sites consistent.
 - **`ApiOptions` is bound but not consumed internally.** This is documented as intentional (host-app convenience) in the README — don't "fix" it as a bug without raising it as its own decision first.

@@ -44,7 +44,10 @@ public sealed class SessionStateService : IDisposable
 
     public void Clear() => SetExpired(false);
 
-    /// <summary>Observes expiry events for the active user's cache key.</summary>
+    /// <summary>
+    /// Observes expiry events for the active session's cache key. Get it from
+    /// <see cref="IUserTokenCacheKeyProvider.GetCacheKey(System.Security.Claims.ClaimsPrincipal?)"/>.
+    /// </summary>
     public void Observe(string cacheKey)
     {
         if (expirySource is null || string.IsNullOrWhiteSpace(cacheKey))
