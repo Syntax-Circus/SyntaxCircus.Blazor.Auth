@@ -67,8 +67,9 @@ internal sealed class CookieSessionHost : IDisposable
         services.AddScoped(_ => Substitute.For<AuthenticationStateProvider>());
         services.Configure<OpenIdConnectOptions>(OpenIdConnectDefaults.AuthenticationScheme, options =>
         {
-            options.ClientId = "client1";
-            options.Configuration = new OpenIdConnectConfiguration { TokenEndpoint = "https://auth.example.com/token" };
+            // Only what a test that registers the real OpenID Connect handler has not already set.
+            options.ClientId ??= "client1";
+            options.Configuration ??= new OpenIdConnectConfiguration { TokenEndpoint = "https://auth.example.com/token" };
         });
         services.AddHttpClient<OidcTokenRefreshService>().ConfigurePrimaryHttpMessageHandler(() => identityProvider.CreateHandler());
 
@@ -118,6 +119,38 @@ internal sealed class CookieSessionHost : IDisposable
             var result = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
             await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, result.Principal!, result.Properties);
         });
+
+        // Re-signs with a principal built from scratch (claim types and values only) but the cookie's own
+        // properties, as an app does after reloading the user. With copyProperties, into a new
+        // AuthenticationProperties holding a copy of the items.
+        app.MapGet("/resign-rebuilt", async (HttpContext context, string? sub, bool? copyProperties) =>
+        {
+            var result = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+            var claims = result.Principal!.Claims
+                .Where(claim => claim.Type != SessionIdClaimType)
+                .Select(claim => new Claim(claim.Type, claim.Type == "sub" && sub is not null ? sub : claim.Value));
+            var properties = copyProperties == true
+                ? new AuthenticationProperties(new Dictionary<string, string?>(result.Properties!.Items))
+                : result.Properties!;
+            await context.SignInAsync(
+                CookieAuthenticationDefaults.AuthenticationScheme,
+                new ClaimsPrincipal(new ClaimsIdentity(claims, "rebuilt")),
+                properties);
+        });
+
+        // The step-up pattern: a new identity-provider sign-in started with the current cookie's properties.
+        app.MapGet("/challenge-with-cookie-properties", (Delegate)(async (HttpContext context) =>
+        {
+            var result = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+            // The handler adds this with Items.Add, so it throws unless the last sign-in's value is removed.
+            result.Properties!.Items.Remove(OpenIdConnectDefaults.RedirectUriForCodePropertiesKey);
+            result.Properties.RedirectUri = "/capture";
+            await context.ChallengeAsync(OpenIdConnectDefaults.AuthenticationScheme, result.Properties);
+        }));
+
+        app.MapGet("/challenge", (Delegate)((HttpContext context) => context.ChallengeAsync(
+            OpenIdConnectDefaults.AuthenticationScheme,
+            new AuthenticationProperties { RedirectUri = "/capture" })));
 
         app.MapGet("/me", async (HttpContext context, ServerRequestOidcTokenResolver resolver, IUserTokenCacheKeyProvider keys, IServerTokenCache cache) =>
         {
@@ -176,19 +209,33 @@ internal sealed class CookieSessionHost : IDisposable
         public async Task<HttpResponseMessage> GetAsync(string path)
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, path);
+            var response = await SendAsync(request);
+            response.EnsureSuccessStatusCode();
+            return response;
+        }
+
+        /// <summary>Sends with this jar's cookies and keeps what comes back. Redirects are not followed.</summary>
+        public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request)
+        {
             if (Cookies.Count > 0)
             {
                 request.Headers.Add("Cookie", string.Join("; ", Cookies.Select(pair => $"{pair.Key}={pair.Value}")));
             }
 
             var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
-            response.EnsureSuccessStatusCode();
             if (response.Headers.TryGetValues("Set-Cookie", out var setCookies))
             {
                 foreach (var setCookie in setCookies)
                 {
                     var pair = setCookie.Split(';', 2)[0].Split('=', 2);
-                    Cookies[pair[0]] = pair[1];
+                    if (pair[1].Length == 0)
+                    {
+                        Cookies.Remove(pair[0]);
+                    }
+                    else
+                    {
+                        Cookies[pair[0]] = pair[1];
+                    }
                 }
             }
 

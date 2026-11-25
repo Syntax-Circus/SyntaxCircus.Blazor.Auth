@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 
@@ -23,6 +24,9 @@ public sealed class ServerRequestOidcTokenResolver(
     TimeProvider? timeProvider = null)
 {
     internal const string HttpContextItemKey = "SyntaxCircus.Blazor.Auth.ServerRequestOidcTokenResolution";
+
+    // The resolver is scoped, so what has been reported is keyed by the host's singleton options.
+    private static readonly ConditionalWeakTable<IOptions<AuthOptions>, object> MissingSessionIdReported = [];
 
     private readonly TimeProvider clock = timeProvider ?? TimeProvider.System;
 
@@ -94,12 +98,18 @@ public sealed class ServerRequestOidcTokenResolver(
 
         var authenticateResult = await httpContext.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme).ConfigureAwait(false);
         var authProperties = authenticateResult.Succeeded ? authenticateResult.Properties : null;
-        if (authProperties?.Items.ContainsKey(SessionId.PropertiesKey) == true && SessionId.Read(httpContext.User) is null)
+        if (authProperties?.Items.ContainsKey(SessionId.PropertiesKey) == true
+            && SessionId.Read(httpContext.User) is null
+            // Once per host: the cause is configuration, and it would otherwise be logged on every request.
+            && MissingSessionIdReported.TryAdd(options, options))
         {
             logger.LogWarning(
                 "The request's principal is missing the session id its '{Scheme}' cookie was issued with, so the "
                 + "per-user token cache key is in use and this user's sign-in sessions share cached tokens. Check for "
-                + "an IClaimsTransformation or similar that rebuilds the principal without the '{ClaimType}' claim.",
+                + "an IClaimsTransformation or middleware that rebuilds the principal without the '{ClaimType}' claim, "
+                + "and for events that replace the principal in ValidatePrincipal after a PostConfigure registered "
+                + "after AddBlazorTokenForwarding replaced Events or OnValidatePrincipal without calling the previous "
+                + "handler. This is logged once.",
                 CookieAuthenticationDefaults.AuthenticationScheme,
                 SessionId.ClaimType);
         }

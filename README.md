@@ -77,27 +77,36 @@ Since 0.3.0, cached tokens belong to one sign-in session, not to the user. Two b
 
 - **The session id.** When a cookie scheme signs in, the principal gets a random 256-bit id in a `urn:syntaxcircus:blazor-auth:session-id` claim. It is a claim because an interactive circuit has only the `ClaimsPrincipal`. Only a claim with the issuer `SyntaxCircus.Blazor.Auth` counts, so a claim of that type from your identity provider is replaced at sign-in and cannot choose the id.
 - **Cache key.** With an id: `user-session:{id}:{subject}`. Without one: `user:{subject}`, as before. A session with an id never reads the per-user entry or another session's entry, even when its own is empty. The id appears wherever cache keys are logged; it is not a credential.
-- **What keeps the id:** token refreshes, sliding-expiration renewal, signing the current principal in again, and replacing the principal in `OnValidatePrincipal` (as ASP.NET Core Identity's security-stamp check does).
-- **What starts a new one:** every new sign-in with a new principal, such as each OpenID Connect sign-in.
-- **When you re-sign a principal you built yourself** (a profile update, say), start from `principal.Clone()` or add the existing `Claim` object. Otherwise the cookie gets a new id while circuits already open keep the old one until the page is reloaded. A claim rebuilt from its type and value alone loses the issuer and does not count. In the opposite direction, don't copy every claim of an already signed-in principal into a **new** sign-in, because that carries the old id across.
+- **What keeps the id:** token refreshes, sliding-expiration renewal, signing the current principal in again, replacing the principal in `OnValidatePrincipal` or a `ValidatePrincipal` override (as ASP.NET Core Identity's security-stamp check does), and re-signing a rebuilt principal as described below.
+- **What starts a new one:** every new sign-in with a new principal and new `AuthenticationProperties`, such as each OpenID Connect sign-in. That includes a challenge you start with an old cookie's properties (a step-up, say): they pass through the OpenID Connect `state`, and the old id is not taken from them.
+- **When you re-sign a principal you built yourself** (a profile update, say), pass the cookie's own properties: those `AuthenticateAsync` returned **in the same request**, to the same scheme, for the same subject. The id is then kept, so circuits already open stay with the cookie.
+
+  ```csharp
+  var current = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+  await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, rebuiltPrincipal, current.Properties);
+  ```
+
+  With new or cloned properties (`Clone()`, or a copy of `Items`), the cookie gets a new id unless the principal still carries the existing `Claim` object (`principal.Clone()` does; a claim rebuilt from its type and value loses the issuer and does not count). A circuit already open then keeps the old id while the cookie has the new one. Both refresh from the same refresh token, so a provider that rotates refresh tokens rejects the second use and the session is lost: the user has to sign in again.
+- **A new sign-in must not reuse the old session's objects.** If your own code signs a user in again (a new password login, say), use new `AuthenticationProperties`: signing the same subject in with the current cookie's own properties continues that session, so copies of the old cookie would receive the new tokens. Likewise don't copy every claim of an already signed-in principal into a new sign-in, which carries the old id across.
 
 ### Cookie configuration
 
-It works whether `AddCookie` is called before or after `AddBlazorTokenForwarding`, with your own `OnSigningIn` and `OnValidatePrincipal` handlers (they run first), with an assigned `options.Events` instance, with a server-side `SessionStore`, and with any cookie scheme name. The request path still reads tokens only from the default `Cookies` scheme.
+It works whether `AddCookie` is called before or after `AddBlazorTokenForwarding`, with your own `OnSigningIn` and `OnValidatePrincipal` handlers (they run first), with an assigned `options.Events` instance or events subclass, with `EventsType`, with a server-side `SessionStore`, and with any cookie scheme name. The request path still reads tokens only from the default `Cookies` scheme.
 
 In two cases the package forwards your events through its own instance, so that it still runs:
 
 | Your configuration | What changes |
 |---|---|
-| An events subclass that overrides `SigningIn` | `options.Events` becomes a plain `CookieAuthenticationEvents` that calls every method on your instance. Code that casts `options.Events` back to your type no longer finds it. |
+| An events subclass that overrides `SigningIn` or `ValidatePrincipal` | `options.Events` becomes a plain `CookieAuthenticationEvents` that calls every method on your instance. Code that casts `options.Events` back to your type no longer finds it. |
 | `options.EventsType` | `options.EventsType` becomes a package type that resolves your type from request services and calls it. |
 
-It cannot protect a session in these cases. Each one leaves that user's sessions sharing the per-user entry, and is reported with a logged warning:
+It cannot protect a session in these cases:
 
-| Cause | When the warning is logged |
-|---|---|
-| A `PostConfigure<CookieAuthenticationOptions>` registered **after** `AddBlazorTokenForwarding` that replaces `Events`, `EventsType` or `OnSigningIn` without calling the previous handler | when the package next re-signs a cookie after a token refresh ("sign-in hook did not run") |
-| An `IClaimsTransformation` (or middleware) that rebuilds `HttpContext.User` without the claim | on each token resolution for an affected request ("is missing the session id") |
+| Cause | What happens | Warning logged |
+|---|---|---|
+| A `PostConfigure<CookieAuthenticationOptions>` registered **after** `AddBlazorTokenForwarding` that replaces `Events`, `EventsType` or `OnSigningIn` without calling the previous handler | New sign-ins get no id, so the user's sessions share the per-user entry | When the package next re-signs a cookie after a token refresh ("sign-in hook did not run") |
+| The same, replacing only `OnValidatePrincipal` | A principal replaced during validation loses the id and falls back to the per-user entry. A rebuilt principal re-signed with the cookie's own properties gets a new id (see above) | Only for the lost id ("is missing the session id"); **none** for the re-sign |
+| An `IClaimsTransformation` (or middleware) that rebuilds `HttpContext.User` without the claim | The affected requests use the per-user entry | Once per application instance ("is missing the session id") |
 
 There is **no** warning if your own `AuthenticationStateProvider` gives circuits a rebuilt principal without the claim (or with the claim's issuer lost): the circuit then looks under the per-user key.
 
@@ -108,7 +117,7 @@ There is **no** warning if your own `AuthenticationStateProvider` gives circuits
 ### Upgrading from 0.2.x
 
 - **Cookies issued before the upgrade keep working, and keep the per-user key**, including through token refreshes (moving only the cookie to a new key would strand circuits already open on the old one, and replay rotated refresh tokens). So pre-upgrade sessions still share `user:{subject}` **with each other** until they sign in again. They never receive tokens from a sign-in made after the upgrade. If you need all sharing to stop at once, make everyone sign in again, for example by renaming the auth cookie.
-- If your own code re-signs a pre-upgrade cookie with `SignInAsync`, that does give it an id. Circuits already open for it stay on the per-user key until reloaded.
+- **Your own `SignInAsync` of a pre-upgrade cookie does give it an id**, whether you pass the same principal or a rebuilt one, and nothing is logged. A circuit opened before that keeps the per-user key while the cookie moves to the new one. If either then refreshes and your provider rotates refresh tokens, they end up presenting the same one twice: it is rejected (some providers then revoke the whole grant) and the user has to sign in again. This can happen once per pre-upgrade cookie, and only if a circuit opened before the re-sign is still in use, in another tab for example (reloading it avoids the problem). If your app re-signs cookies this way, the sure remedy is to make everyone sign in again when you upgrade.
 - **`GetCacheKey(subject)` no longer returns the key the package uses** for a signed-in session. It returns the per-user key. Use `GetCacheKey(principal)` for `SessionStateService.Observe`, `SessionExpiryBroker.Subscribe` and direct `IServerTokenCache` calls. Calls made with a bare subject or a hand-built `user:{subject}` key compile but silently find nothing for new sessions.
 - Code that acted on all of a user's sessions through that one entry (reading the user's token in a background job, evicting it to force a refresh or sign-out) no longer reaches new sessions, and there is no API that lists a user's sessions.
 - The request path now calls `GetCacheKey(principal)` instead of `GetCacheKey(subject)`. This matters only to a custom provider whose two overloads disagree.

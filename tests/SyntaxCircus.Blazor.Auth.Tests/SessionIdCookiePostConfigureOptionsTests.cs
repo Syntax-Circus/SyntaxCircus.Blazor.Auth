@@ -73,6 +73,72 @@ public class SessionIdCookiePostConfigureOptionsTests
         calls.ShouldContain("override:ValidatePrincipal");
     }
 
+    [Theory]
+    [InlineData(BaseCall.Never)]
+    [InlineData(BaseCall.BeforeReplacing)]
+    [InlineData(BaseCall.AfterReplacing)]
+    public async Task EventsSubclassOverridingOnlyValidatePrincipal_KeepsTheSessionIdWhenItReplacesThePrincipal(BaseCall baseCall)
+    {
+        var events = new ReplacingEvents { CallBase = baseCall };
+        using var host = CookieSessionHost.Create(
+            configureAfter: services => services.Configure<CookieAuthenticationOptions>(Scheme, options => options.Events = events));
+        var browser = host.NewBrowser();
+        await browser.LoginAsync("user-1", "A", expiresIn: 3600);
+        var before = await browser.MeAsync();
+        events.Replace = true;
+
+        var during = await browser.MeAsync();
+        events.Replace = false;
+        var after = await browser.MeAsync();
+
+        during.CacheKey.ShouldBe(before.CacheKey);
+        after.CacheKey.ShouldBe(before.CacheKey);
+        after.ClaimTypes.ShouldContain("replaced");
+        host.Logs.LibraryWarnings.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task PrincipalSetInCheckSlidingExpiration_IsNotWhatTheHandlerRenews()
+    {
+        // The one other event that exposes a settable principal. The handler renews the ticket it read, so
+        // an override of it cannot drop the session id and needs no forwarding.
+        var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        var events = new SlidingReplacingEvents();
+        using var host = CookieSessionHost.Create(
+            configureAfter: services => services.Configure<CookieAuthenticationOptions>(Scheme, options =>
+            {
+                options.TimeProvider = clock;
+                options.ExpireTimeSpan = TimeSpan.FromMinutes(10);
+                options.SlidingExpiration = true;
+                options.Events = events;
+            }));
+        var browser = host.NewBrowser();
+        await browser.LoginAsync("user-1", "A", expiresIn: 3600);
+        var before = await browser.MeAsync();
+        var originalCookie = browser.Cookies.Values.Single();
+        events.Replace = true;
+
+        clock.Advance(TimeSpan.FromMinutes(6));
+        await browser.GetAsync("/me");
+        events.Replace = false;
+
+        browser.Cookies.Values.Single().ShouldNotBe(originalCookie);
+        var after = await browser.MeAsync();
+        after.CacheKey.ShouldBe(before.CacheKey);
+        after.ClaimTypes.ShouldNotContain("replaced");
+    }
+
+    [Fact]
+    public async Task NullEvents_AreTreatedAsTheHandlerWouldTreatThem()
+    {
+        using var host = CookieSessionHost.Create(
+            configureAfter: services => services.Configure<CookieAuthenticationOptions>(Scheme, options => options.Events = null!));
+
+        var view = await SignInAndViewAsync(host);
+
+        view.SessionIds.ShouldHaveSingleItem();
+    }
+
     [Fact]
     public async Task EventsType_StillGetsASessionId_AndIsResolvedFromDependencyInjection()
     {
@@ -343,6 +409,30 @@ public class SessionIdCookiePostConfigureOptionsTests
     }
 
     [Fact]
+    public async Task LostSessionIdWarning_IsLoggedOncePerHost_AndNamesBothCauses()
+    {
+        for (var hostNumber = 0; hostNumber < 2; hostNumber++)
+        {
+            var drop = new DroppingClaimsTransformation();
+            using var host = CookieSessionHost.Create(
+                configureBefore: services => services.AddSingleton<IClaimsTransformation>(drop));
+            var browser = host.NewBrowser();
+            await browser.LoginAsync("user-1", "A", expiresIn: 3600);
+            drop.Enabled = true;
+
+            await browser.MeAsync();
+            await browser.MeAsync();
+            await browser.MeAsync();
+
+            var warning = host.Logs.LibraryWarnings
+                .Where(message => message.Contains("is missing the session id", StringComparison.Ordinal))
+                .ShouldHaveSingleItem();
+            warning.ShouldContain("IClaimsTransformation");
+            warning.ShouldContain("ValidatePrincipal");
+        }
+    }
+
+    [Fact]
     public async Task AddBlazorTokenForwardingCalledTwice_RegistersTheHookOnce()
     {
         using var host = CookieSessionHost.Create(
@@ -421,6 +511,57 @@ public class SessionIdCookiePostConfigureOptionsTests
     }
 
     private sealed class DependencyInjectedEvents(CallLog calls) : OverridingEvents(calls);
+
+    private sealed class SlidingReplacingEvents : CookieAuthenticationEvents
+    {
+        public bool Replace { get; set; }
+
+        public override Task CheckSlidingExpiration(CookieSlidingExpirationContext context)
+        {
+            if (Replace)
+            {
+                context.Principal = new ClaimsPrincipal(new ClaimsIdentity(
+                    [context.Principal!.FindFirst("sub")!, new Claim("replaced", "1")], "rebuilt"));
+                context.ShouldRenew = true;
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+
+    public enum BaseCall
+    {
+        Never,
+        BeforeReplacing,
+        AfterReplacing,
+    }
+
+    private sealed class ReplacingEvents : CookieAuthenticationEvents
+    {
+        public BaseCall CallBase { get; init; }
+
+        public bool Replace { get; set; }
+
+        public override async Task ValidatePrincipal(CookieValidatePrincipalContext context)
+        {
+            if (CallBase == BaseCall.BeforeReplacing)
+            {
+                await base.ValidatePrincipal(context);
+            }
+
+            if (Replace)
+            {
+                context.ReplacePrincipal(new ClaimsPrincipal(new ClaimsIdentity(
+                    [context.Principal!.FindFirst("sub")!, new Claim("replaced", "1")], "rebuilt")));
+                context.ShouldRenew = true;
+            }
+
+            if (CallBase == BaseCall.AfterReplacing)
+            {
+                await base.ValidatePrincipal(context);
+            }
+        }
+    }
 
     private sealed class DroppingClaimsTransformation : IClaimsTransformation
     {

@@ -3,8 +3,8 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 namespace SyntaxCircus.Blazor.Auth;
 
 /// <summary>
-/// Wraps a cookie scheme's events so every new sign-in gets its own session id and a principal the
-/// host rebuilds keeps it. The host's handlers run first.
+/// Wraps a cookie scheme's events so every new sign-in gets its own session id, and a principal the
+/// host rebuilds for the same session keeps it. The host's handlers run first.
 /// </summary>
 internal static class SessionIdCookieHook
 {
@@ -50,7 +50,7 @@ internal static class SessionIdCookieHook
         }
         else
         {
-            sessionId ??= SessionId.Create();
+            sessionId ??= CookieRead.ContinuedSessionId(context) ?? SessionId.Create();
         }
 
         if (sessionId is null)
@@ -78,6 +78,8 @@ internal static class SessionIdCookieHook
         public async Task InvokeAsync(CookieValidatePrincipalContext context)
         {
             var incoming = SessionId.Read(context.Principal);
+            // Before the host's handler runs: it may replace the principal, or sign the cookie in again.
+            CookieRead.Remember(context, incoming);
             await next(context).ConfigureAwait(false);
 
             // A replaced principal (ASP.NET Core Identity's security-stamp check, for one) is renewed

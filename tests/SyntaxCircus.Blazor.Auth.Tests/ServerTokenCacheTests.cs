@@ -9,6 +9,39 @@ public class ServerTokenCacheTests
     private static ServerTokenCacheEntry EntryExpiringAt(DateTimeOffset expiresAt)
         => new("access", "refresh", null, expiresAt);
 
+    /// <summary>Runs <see cref="OnNextRead"/> the next time the clock is read, to interleave a write deterministically.</summary>
+    private sealed class InterleavingClock : TimeProvider
+    {
+        public Action? OnNextRead { get; set; }
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            var action = OnNextRead;
+            OnNextRead = null;
+            action?.Invoke();
+            return DateTimeOffset.UtcNow;
+        }
+    }
+
+    [Fact]
+    public async Task GetAsync_DroppingAnExpiredEntry_LeavesOneWrittenSinceItWasRead()
+    {
+        var clock = new InterleavingClock();
+        var cache = new ServerTokenCache(clock);
+        await cache.SetAsync(
+            "user:1",
+            new ServerTokenCacheEntry("short-lived", null, null, DateTimeOffset.UtcNow.AddMilliseconds(30)),
+            TestContext.Current.CancellationToken);
+        await Task.Delay(60, TestContext.Current.CancellationToken);
+        var replacement = EntryExpiringAt(DateTimeOffset.UtcNow.AddHours(1));
+        // GetAsync reads the clock between reading the expired entry and removing it.
+        clock.OnNextRead = () => _ = cache.SetAsync("user:1", replacement, CancellationToken.None);
+
+        (await cache.GetAsync("user:1", TestContext.Current.CancellationToken)).ShouldBeNull();
+
+        (await cache.GetAsync("user:1", TestContext.Current.CancellationToken)).ShouldBe(replacement);
+    }
+
     [Fact]
     public async Task SetAsync_EvictsEntriesThirtyDaysPastAccessTokenExpiry()
     {

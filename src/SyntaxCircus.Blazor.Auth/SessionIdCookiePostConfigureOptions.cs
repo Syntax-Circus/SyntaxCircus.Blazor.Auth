@@ -5,10 +5,11 @@ namespace SyntaxCircus.Blazor.Auth;
 /// <summary>
 /// Adds <see cref="SessionIdCookieHook"/> to every cookie scheme. Post-configuration runs after all
 /// <c>Configure</c> callbacks, so it does not matter whether <c>AddCookie</c> is called before or
-/// after <c>AddBlazorTokenForwarding</c>. Wrapping the <c>OnSigningIn</c> delegate is not enough in
-/// two cases, which are forwarded through a separate events instance instead: a host that sets
-/// <c>EventsType</c> (the handler then ignores <c>Options.Events</c>), and an events subclass that
-/// overrides <c>SigningIn</c> (which need not call the delegate).
+/// after <c>AddBlazorTokenForwarding</c>. Wrapping the <c>OnSigningIn</c> and
+/// <c>OnValidatePrincipal</c> delegates is not enough in two cases, which are forwarded through a
+/// separate events instance instead: a host that sets <c>EventsType</c> (the handler then ignores
+/// <c>Options.Events</c>), and an events subclass that overrides <c>SigningIn</c> or
+/// <c>ValidatePrincipal</c> (an override need not call its delegate, or may change the principal first).
 /// </summary>
 internal sealed class SessionIdCookiePostConfigureOptions : IPostConfigureOptions<CookieAuthenticationOptions>
 {
@@ -28,7 +29,10 @@ internal sealed class SessionIdCookiePostConfigureOptions : IPostConfigureOption
             return;
         }
 
-        if (OverridesSigningIn(options.Events))
+        // The handler creates default events when a host sets none.
+        options.Events ??= new CookieAuthenticationEvents();
+
+        if (OverridesWrappedEvent(options.Events))
         {
             options.Events = Forward(options.Events);
         }
@@ -57,11 +61,15 @@ internal sealed class SessionIdCookiePostConfigureOptions : IPostConfigureOption
         events.OnRedirectToReturnUrl = inner.RedirectToReturnUrl;
     }
 
-    private static bool OverridesSigningIn(CookieAuthenticationEvents events)
+    // The two events the hook wraps. The session id depends on no other: the cookie handler ignores a
+    // principal set in CheckSlidingExpiration, and the rest run after the ticket is written or never write one.
+    private static bool OverridesWrappedEvent(CookieAuthenticationEvents events)
     {
         // A delegate over a virtual method binds to the override the instance actually dispatches to.
         Func<CookieSigningInContext, Task> signingIn = events.SigningIn;
-        return signingIn.Method.DeclaringType != typeof(CookieAuthenticationEvents);
+        Func<CookieValidatePrincipalContext, Task> validatePrincipal = events.ValidatePrincipal;
+        return signingIn.Method.DeclaringType != typeof(CookieAuthenticationEvents)
+            || validatePrincipal.Method.DeclaringType != typeof(CookieAuthenticationEvents);
     }
 }
 
