@@ -80,24 +80,18 @@ internal sealed class CookieSessionHost : IDisposable
         // Signs in the way the OIDC handler does: a brand-new principal and brand-new properties.
         app.MapGet("/login", async (HttpContext context, string sub, string access, string refresh, int expiresIn, string? forgedSessionId) =>
         {
-            var claims = new List<Claim> { new("sub", sub) };
-            if (forgedSessionId is not null)
-            {
-                claims.Add(new Claim(SessionIdClaimType, forgedSessionId, ClaimValueTypes.String, "https://auth.example.com"));
-            }
-
             var properties = new AuthenticationProperties();
             properties.StoreTokens(Tokens(access, refresh, expiresIn));
 
             await context.SignInAsync(
                 CookieAuthenticationDefaults.AuthenticationScheme,
-                new ClaimsPrincipal(new ClaimsIdentity(claims, "oidc")),
+                new ClaimsPrincipal(new ClaimsIdentity(Claims(sub, forgedSessionId), "oidc")),
                 properties);
         });
 
         // Issues the cookie a host running an earlier package version issued: the real ticket format,
         // written without going through SigningIn, so there is no session id.
-        app.MapGet("/pre-upgrade-login", (HttpContext context, IOptionsMonitor<CookieAuthenticationOptions> cookieOptions, string sub, string access, string refresh, int expiresIn) =>
+        app.MapGet("/pre-upgrade-login", (HttpContext context, IOptionsMonitor<CookieAuthenticationOptions> cookieOptions, string sub, string access, string refresh, int expiresIn, string? forgedSessionId) =>
         {
             var options = cookieOptions.Get(CookieAuthenticationDefaults.AuthenticationScheme);
             var properties = new AuthenticationProperties
@@ -107,7 +101,7 @@ internal sealed class CookieSessionHost : IDisposable
             };
             properties.StoreTokens(Tokens(access, refresh, expiresIn));
             var ticket = new AuthenticationTicket(
-                new ClaimsPrincipal(new ClaimsIdentity([new Claim("sub", sub)], "oidc")),
+                new ClaimsPrincipal(new ClaimsIdentity(Claims(sub, forgedSessionId), "oidc")),
                 properties,
                 CookieAuthenticationDefaults.AuthenticationScheme);
             context.Response.Cookies.Append(options.Cookie.Name!, options.TicketDataFormat.Protect(ticket));
@@ -122,8 +116,9 @@ internal sealed class CookieSessionHost : IDisposable
 
         // Re-signs with a principal built from scratch (claim types and values only) but the cookie's own
         // properties, as an app does after reloading the user. With copyProperties, into a new
-        // AuthenticationProperties holding a copy of the items.
-        app.MapGet("/resign-rebuilt", async (HttpContext context, string? sub, bool? copyProperties) =>
+        // AuthenticationProperties holding a copy of the items; with cloneProperties, into a Clone().
+        // forgedSessionId adds a session-id claim as an identity provider would have issued it.
+        app.MapGet("/resign-rebuilt", async (HttpContext context, string? sub, bool? copyProperties, bool? cloneProperties, string? forgedSessionId) =>
         {
             var result = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
             var claims = result.Principal!.Claims
@@ -131,7 +126,12 @@ internal sealed class CookieSessionHost : IDisposable
                 .Select(claim => new Claim(claim.Type, claim.Type == "sub" && sub is not null ? sub : claim.Value));
             var properties = copyProperties == true
                 ? new AuthenticationProperties(new Dictionary<string, string?>(result.Properties!.Items))
-                : result.Properties!;
+                : cloneProperties == true ? result.Properties!.Clone() : result.Properties!;
+            if (forgedSessionId is not null)
+            {
+                claims = claims.Append(ForgedSessionIdClaim(forgedSessionId));
+            }
+
             await context.SignInAsync(
                 CookieAuthenticationDefaults.AuthenticationScheme,
                 new ClaimsPrincipal(new ClaimsIdentity(claims, "rebuilt")),
@@ -178,6 +178,12 @@ internal sealed class CookieSessionHost : IDisposable
         host.capturedPrincipal = () => captured;
         return host;
     }
+
+    private static Claim ForgedSessionIdClaim(string value)
+        => new(SessionIdClaimType, value, ClaimValueTypes.String, "https://auth.example.com");
+
+    private static List<Claim> Claims(string sub, string? forgedSessionId)
+        => forgedSessionId is null ? [new("sub", sub)] : [new("sub", sub), ForgedSessionIdClaim(forgedSessionId)];
 
     private static AuthenticationToken[] Tokens(string access, string refresh, int expiresIn) =>
     [
@@ -246,8 +252,9 @@ internal sealed class CookieSessionHost : IDisposable
             => GetAsync($"/login?sub={Uri.EscapeDataString(sub)}&access=access-{tokenSuffix}&refresh=refresh-{tokenSuffix}&expiresIn={expiresIn}"
                 + (forgedSessionId is null ? string.Empty : $"&forgedSessionId={Uri.EscapeDataString(forgedSessionId)}"));
 
-        public Task PreUpgradeLoginAsync(string sub, string tokenSuffix, int expiresIn)
-            => GetAsync($"/pre-upgrade-login?sub={Uri.EscapeDataString(sub)}&access=access-{tokenSuffix}&refresh=refresh-{tokenSuffix}&expiresIn={expiresIn}");
+        public Task PreUpgradeLoginAsync(string sub, string tokenSuffix, int expiresIn, string? forgedSessionId = null)
+            => GetAsync($"/pre-upgrade-login?sub={Uri.EscapeDataString(sub)}&access=access-{tokenSuffix}&refresh=refresh-{tokenSuffix}&expiresIn={expiresIn}"
+                + (forgedSessionId is null ? string.Empty : $"&forgedSessionId={Uri.EscapeDataString(forgedSessionId)}"));
 
         public async Task<SessionView> MeAsync()
         {

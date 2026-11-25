@@ -28,13 +28,17 @@ internal static class SessionId
 
     /// <summary>
     /// Returns <paramref name="principal"/> carrying <paramref name="sessionId"/> as its only session-id
-    /// claim. A principal that needs changing is cloned first, so an instance the caller holds on to
-    /// (and might sign in again for another session) is never mutated.
+    /// claim, or no such claim when it is <see langword="null"/>. A principal that needs changing is
+    /// cloned first, so an instance the caller holds on to (and might sign in again for another
+    /// session) is never mutated.
     /// </summary>
-    internal static ClaimsPrincipal Apply(ClaimsPrincipal principal, string sessionId)
+    internal static ClaimsPrincipal Apply(ClaimsPrincipal principal, string? sessionId)
     {
         var existing = principal.FindAll(ClaimType).ToList();
-        if (existing is [var only] && IsOurs(only) && string.Equals(only.Value, sessionId, StringComparison.Ordinal))
+        var alreadyApplied = sessionId is null
+            ? existing.Count == 0
+            : existing is [var only] && IsOurs(only) && string.Equals(only.Value, sessionId, StringComparison.Ordinal);
+        if (alreadyApplied)
         {
             return principal;
         }
@@ -48,8 +52,12 @@ internal static class SessionId
             }
         }
 
-        var target = copy.Identities.FirstOrDefault(identity => identity.IsAuthenticated) ?? copy.Identities.FirstOrDefault();
-        target?.AddClaim(new Claim(ClaimType, sessionId, ClaimValueTypes.String, Issuer));
+        if (sessionId is not null)
+        {
+            var target = copy.Identities.FirstOrDefault(identity => identity.IsAuthenticated) ?? copy.Identities.FirstOrDefault();
+            target?.AddClaim(new Claim(ClaimType, sessionId, ClaimValueTypes.String, Issuer));
+        }
+
         return copy;
     }
 

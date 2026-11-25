@@ -90,8 +90,10 @@ public class SessionIdCookieHookTests
         (await browser.MeAsync()).CacheKey.ShouldBe(before.CacheKey);
     }
 
-    [Fact]
-    public async Task SigningAnotherSchemeInWithTheCookiesProperties_StartsANewSessionId()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SigningAnotherSchemeInWithTheCookiesProperties_StartsANewSessionId(bool preUpgradeCookie)
     {
         var signInOtherScheme = false;
         string? otherId = null;
@@ -119,13 +121,16 @@ public class SessionIdCookieHookTests
                     });
             });
         var browser = host.NewBrowser();
-        await browser.LoginAsync("user-1", "A", expiresIn: 3600);
-        var id = (await browser.MeAsync()).SessionIds.ShouldHaveSingleItem();
+        await (preUpgradeCookie
+            ? browser.PreUpgradeLoginAsync("user-1", "A", expiresIn: 3600)
+            : browser.LoginAsync("user-1", "A", expiresIn: 3600));
+        var ids = (await browser.MeAsync()).SessionIds;
+        ids.Length.ShouldBe(preUpgradeCookie ? 0 : 1);
         signInOtherScheme = true;
 
         await browser.GetAsync("/cookie-tokens");
 
-        otherId.ShouldNotBeNull().ShouldNotBe(id);
+        ids.ShouldNotContain(otherId.ShouldNotBeNull());
     }
 
     [Theory]
@@ -159,37 +164,121 @@ public class SessionIdCookieHookTests
         (await copiedOldCookie.MeAsync()).CacheKey.ShouldNotBe(newView.CacheKey);
     }
 
-    [Fact]
-    public async Task AppReSigningAPreUpgradeCookie_GivesItASessionId()
+    [Theory]
+    [InlineData("/resign")]
+    [InlineData("/resign-rebuilt")]
+    public async Task AppReSigningAPreUpgradeCookieWithItsOwnProperties_KeepsThePerUserKey(string reSign)
     {
-        // Documented in the README: unlike the package's own refresh re-sign, an app's SignInAsync does
-        // assign an id to a cookie issued before the upgrade.
         using var host = CookieSessionHost.Create();
         var browser = host.NewBrowser();
         await browser.PreUpgradeLoginAsync("user-1", "A", expiresIn: 3600);
-        (await browser.MeAsync()).CacheKey.ShouldBe("user:user-1");
+        var cookie = browser.Cookies.Values.Single();
 
-        await browser.GetAsync("/resign-rebuilt");
+        await browser.GetAsync(reSign);
 
-        (await browser.MeAsync()).SessionIds.ShouldHaveSingleItem();
+        browser.Cookies.Values.Single().ShouldNotBe(cookie);
+        var view = await browser.MeAsync();
+        view.CacheKey.ShouldBe("user:user-1");
+        view.SessionIds.ShouldBeEmpty();
+        host.Logs.LibraryWarnings.ShouldBeEmpty();
     }
 
-    [Fact]
-    public async Task CircuitOpenAcrossAnAppReSignOfAPreUpgradeCookie_CanReplayARotatedRefreshToken()
+    [Theory]
+    [InlineData("/resign")]
+    [InlineData("/resign-rebuilt")]
+    public async Task CircuitOpenAcrossAnAppReSignOfAPreUpgradeCookie_NeverMakesARotatedRefreshTokenBeReplayed(string reSign)
     {
-        // Pins the documented limitation, so that a change in it is noticed and the README updated.
         using var host = CookieSessionHost.Create();
         host.IdentityProvider.RotatesRefreshTokens = true;
-        host.IdentityProvider.ExpiresInSeconds = 30;
+        host.IdentityProvider.ExpiresInSeconds = 30; // every issued token is already due for refresh
         var browser = host.NewBrowser();
         await browser.PreUpgradeLoginAsync("user-1", "A", expiresIn: 30);
         var circuitPrincipal = await browser.PrincipalAsync();
 
-        await browser.GetAsync("/resign");
+        await browser.GetAsync(reSign);
         await CircuitTokenAsync(host, circuitPrincipal);
-        await browser.MeAsync();
+        var view = await browser.MeAsync();
 
-        host.IdentityProvider.Presented.GroupBy(token => token).ShouldContain(group => group.Count() > 1);
+        host.IdentityProvider.Presented.ShouldBeUnique();
+        view.Token.ShouldNotBeNull();
+    }
+
+    [Theory]
+    [InlineData("/resign-rebuilt?copyProperties=true")]
+    [InlineData("/resign-rebuilt?cloneProperties=true")]
+    [InlineData("/resign-rebuilt?sub=user-2")]
+    public async Task ReSigningAPreUpgradeCookieAsAnythingButItsOwnContinuation_GetsASessionId(string reSign)
+    {
+        using var host = CookieSessionHost.Create();
+        var browser = host.NewBrowser();
+        await browser.PreUpgradeLoginAsync("user-1", "A", expiresIn: 3600);
+
+        await browser.GetAsync(reSign);
+
+        var view = await browser.MeAsync();
+        view.SessionIds.ShouldHaveSingleItem();
+        view.CacheKey.ShouldNotBeNull().ShouldStartWith("user-session:");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NewOpenIdConnectSignInOverAPreUpgradeCookie_GetsASessionId(bool callbackReadsTheOldCookie)
+    {
+        using var provider = new FakeOpenIdProvider();
+        var callbackReadAnIdlessCookie = false;
+        using var host = CookieSessionHost.Create(
+            configureBefore: services => provider.Register(services, async context =>
+            {
+                if (callbackReadsTheOldCookie)
+                {
+                    // All the evidence of a continuation but one: the sign-in's items are not the ones read.
+                    var old = await context.HttpContext.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+                    callbackReadAnIdlessCookie = old.Succeeded
+                        && old.Principal!.FindFirst(CookieSessionHost.SessionIdClaimType) is null
+                        && old.Principal.FindFirstValue("sub") == context.Principal!.FindFirstValue("sub");
+                }
+            }));
+        var browser = host.NewBrowser();
+        await browser.PreUpgradeLoginAsync("user-1", "A", expiresIn: 3600);
+        var copiedPreUpgradeCookie = browser.Copy();
+
+        await FakeOpenIdProvider.SignInAsync(browser, "user-1", "B", challengePath: "/challenge-with-cookie-properties");
+
+        callbackReadAnIdlessCookie.ShouldBe(callbackReadsTheOldCookie);
+        var view = await browser.MeAsync();
+        view.Token.ShouldBe("access-B");
+        view.SessionIds.ShouldHaveSingleItem();
+        view.CacheKey.ShouldNotBeNull().ShouldStartWith("user-session:");
+        (await copiedPreUpgradeCookie.MeAsync()).CacheKey.ShouldBe("user:user-1");
+    }
+
+    public static TheoryData<string> PathsThatLeaveAPreUpgradeSessionWithoutAnId => ["package refresh", "same principal", "rebuilt principal"];
+
+    [Theory]
+    [MemberData(nameof(PathsThatLeaveAPreUpgradeSessionWithoutAnId))]
+    public async Task ProviderSuppliedSessionIdClaim_IsRemovedFromASessionThatStaysWithoutAnId(string path)
+    {
+        // Well formed, so that only its issuer tells it from one of the package's.
+        var forged = new string('a', 42) + "A";
+        using var host = CookieSessionHost.Create();
+        var browser = host.NewBrowser();
+        if (path == "rebuilt principal")
+        {
+            await browser.PreUpgradeLoginAsync("user-1", "A", expiresIn: 3600);
+            await browser.GetAsync($"/resign-rebuilt?forgedSessionId={forged}");
+        }
+        else
+        {
+            await browser.PreUpgradeLoginAsync("user-1", "A", expiresIn: path == "package refresh" ? 30 : 3600, forgedSessionId: forged);
+            // For the package refresh this request is the one that re-signs the cookie.
+            await browser.GetAsync(path == "same principal" ? "/resign" : "/me");
+        }
+
+        var view = await browser.MeAsync();
+
+        view.SessionIds.ShouldBeEmpty();
+        view.CacheKey.ShouldBe("user:user-1");
     }
 
     private static async Task<string?> CircuitTokenAsync(CookieSessionHost host, ClaimsPrincipal principal)

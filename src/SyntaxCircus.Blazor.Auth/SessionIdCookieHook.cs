@@ -48,18 +48,19 @@ internal static class SessionIdCookieHook
                 context.Properties.Items.TryGetValue(SessionId.PropertiesKey, out sessionId);
             }
         }
-        else
+        else if (sessionId is null)
         {
-            sessionId ??= CookieRead.ContinuedSessionId(context) ?? SessionId.Create();
+            // The host continuing a cookie's session keeps what that cookie had, including no id, for
+            // the same reason. Anything else is a new session.
+            sessionId = CookieRead.ContinuedBy(context) is { } read ? read.SessionId : SessionId.Create();
         }
 
-        if (sessionId is null)
-        {
-            return;
-        }
-
+        // Also with no id: a claim of this type that is not ours never stays in the cookie.
         context.Principal = SessionId.Apply(context.Principal, sessionId);
-        context.Properties.Items[SessionId.PropertiesKey] = sessionId;
+        if (sessionId is not null)
+        {
+            context.Properties.Items[SessionId.PropertiesKey] = sessionId;
+        }
     }
 
     private sealed class SigningInWrapper(Func<CookieSigningInContext, Task> next)

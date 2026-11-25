@@ -32,11 +32,12 @@ internal sealed record CookieRead(string Scheme, IDictionary<string, string?> It
     }
 
     /// <summary>
-    /// The id <paramref name="context"/>'s sign-in continues, or <see langword="null"/> when it is a new
-    /// session. Besides the properties, the scheme and the subject must both be the ones read: an id
-    /// never moves to another user.
+    /// The read whose session <paramref name="context"/>'s sign-in continues, or <see langword="null"/>
+    /// when it is a new session. Besides the properties, the scheme and the subject must both be the
+    /// ones read: a session never moves to another user. A read without a <see cref="SessionId"/> is a
+    /// cookie issued before the upgrade, and the sign-in continuing it gets none either.
     /// </summary>
-    public static string? ContinuedSessionId(CookieSigningInContext context)
+    public static CookieRead? ContinuedBy(CookieSigningInContext context)
     {
         if (!context.HttpContext.Items.TryGetValue(ItemKey, out var value) || value is not List<CookieRead> reads)
         {
@@ -46,10 +47,9 @@ internal sealed record CookieRead(string Scheme, IDictionary<string, string?> It
         var subject = SubjectOf(context.Principal);
         return subject is null
             ? null
-            : reads.FirstOrDefault(read => read.SessionId is not null
-                && ReferenceEquals(read.Items, context.Properties.Items)
+            : reads.LastOrDefault(read => ReferenceEquals(read.Items, context.Properties.Items)
                 && string.Equals(read.Scheme, context.Scheme.Name, StringComparison.Ordinal)
-                && string.Equals(read.Subject, subject, StringComparison.Ordinal))?.SessionId;
+                && string.Equals(read.Subject, subject, StringComparison.Ordinal));
     }
 
     private static CookieRead Of(CookieValidatePrincipalContext context, string? sessionId)
