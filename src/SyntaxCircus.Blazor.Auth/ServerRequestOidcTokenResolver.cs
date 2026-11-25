@@ -86,7 +86,7 @@ public sealed class ServerRequestOidcTokenResolver(
         }
 
         var subject = UserTokenCacheKeyProvider.ResolveSubject(httpContext.User);
-        var cacheKey = cacheKeyProvider.GetCacheKey(subject);
+        var cacheKey = cacheKeyProvider.GetCacheKey(httpContext.User);
         if (string.IsNullOrWhiteSpace(cacheKey))
         {
             return default;
@@ -94,6 +94,15 @@ public sealed class ServerRequestOidcTokenResolver(
 
         var authenticateResult = await httpContext.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme).ConfigureAwait(false);
         var authProperties = authenticateResult.Succeeded ? authenticateResult.Properties : null;
+        if (authProperties?.Items.ContainsKey(SessionId.PropertiesKey) == true && SessionId.Read(httpContext.User) is null)
+        {
+            logger.LogWarning(
+                "The request's principal is missing the session id its '{Scheme}' cookie was issued with, so the "
+                + "per-user token cache key is in use and this user's sign-in sessions share cached tokens. Check for "
+                + "an IClaimsTransformation or similar that rebuilds the principal without the '{ClaimType}' claim.",
+                CookieAuthenticationDefaults.AuthenticationScheme,
+                SessionId.ClaimType);
+        }
 
         var accessToken = await ReadTokenAsync(httpContext, authProperties, "access_token").ConfigureAwait(false);
         var refreshToken = await ReadTokenAsync(httpContext, authProperties, "refresh_token").ConfigureAwait(false);
@@ -249,7 +258,7 @@ public sealed class ServerRequestOidcTokenResolver(
         return string.IsNullOrWhiteSpace(contextValue) ? null : contextValue.Trim();
     }
 
-    private static Task PersistRefreshedTokensAsync(HttpContext httpContext, AuthenticateResult authenticateResult, OidcTokenRefreshResult refreshed)
+    private Task PersistRefreshedTokensAsync(HttpContext httpContext, AuthenticateResult authenticateResult, OidcTokenRefreshResult refreshed)
         => PersistTokensAsync(httpContext, authenticateResult, refreshed.AccessToken, refreshed.RefreshToken, refreshed.IdToken, refreshed.ExpiresAtTokenValue);
 
     /// <summary>
@@ -257,7 +266,7 @@ public sealed class ServerRequestOidcTokenResolver(
     /// cookie currently holds (see <see cref="ResolveNearExpiryTokenAsync"/>), rather than from a
     /// freshly-issued <see cref="OidcTokenRefreshResult"/>.
     /// </summary>
-    private static Task PersistRefreshedTokensAsync(HttpContext httpContext, AuthenticateResult authenticateResult, ServerTokenCacheEntry entry)
+    private Task PersistRefreshedTokensAsync(HttpContext httpContext, AuthenticateResult authenticateResult, ServerTokenCacheEntry entry)
         => PersistTokensAsync(
             httpContext,
             authenticateResult,
@@ -266,7 +275,7 @@ public sealed class ServerRequestOidcTokenResolver(
             entry.IdToken,
             entry.ExpiresAtUtc.UtcDateTime.ToString("o", CultureInfo.InvariantCulture));
 
-    private static async Task PersistTokensAsync(
+    private async Task PersistTokensAsync(
         HttpContext httpContext,
         AuthenticateResult authenticateResult,
         string accessToken,
@@ -295,6 +304,19 @@ public sealed class ServerRequestOidcTokenResolver(
             properties.UpdateTokenValue("id_token", idToken);
         }
 
-        await httpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, authenticateResult.Principal, properties).ConfigureAwait(false);
+        var principal = authenticateResult.Principal;
+        var hookRan = await TokenRefreshSignIn.RunAsync(
+            httpContext,
+            properties,
+            () => httpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal, properties)).ConfigureAwait(false);
+        if (!hookRan)
+        {
+            logger.LogWarning(
+                "The session-id sign-in hook did not run when the '{Scheme}' cookie was re-signed, so new sign-ins get "
+                + "no session id and one user's sign-in sessions share cached tokens. Check for a "
+                + "PostConfigure<CookieAuthenticationOptions> registered after AddBlazorTokenForwarding that replaces "
+                + "Events, EventsType or OnSigningIn without calling the previous handler.",
+                CookieAuthenticationDefaults.AuthenticationScheme);
+        }
     }
 }

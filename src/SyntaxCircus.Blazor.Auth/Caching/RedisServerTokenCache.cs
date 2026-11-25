@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.AspNetCore.DataProtection;
@@ -23,7 +22,9 @@ public sealed class RedisServerTokenCache(
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _refreshLocks = new(StringComparer.Ordinal);
+    private readonly KeyedRefreshLock _refreshLocks = new();
+
+    internal int RefreshLockCount => _refreshLocks.Count;
 
     private readonly Lazy<IDataProtector?> _protector = new(() =>
     {
@@ -94,17 +95,7 @@ public sealed class RedisServerTokenCache(
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(action);
-        var refreshLock = _refreshLocks.GetOrAdd(BuildKey(cacheKey), _ => new SemaphoreSlim(1, 1));
-
-        await refreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            return await action(cancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            refreshLock.Release();
-        }
+        return await _refreshLocks.RunAsync(BuildKey(cacheKey), action, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<ServerTokenCacheEntry?> ReadAsync(string cacheKey, CancellationToken cancellationToken)

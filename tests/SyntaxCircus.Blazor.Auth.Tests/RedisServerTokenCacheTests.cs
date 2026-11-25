@@ -41,6 +41,19 @@ public class RedisServerTokenCacheTests
     private static JsonSerializerOptions JsonOptions { get; } = new(JsonSerializerDefaults.Web);
 
     [Fact]
+    public async Task WithRefreshLockAsync_ReleasesTheLockOnceNobodyUsesTheKey()
+    {
+        var (cache, _) = CreateCache();
+
+        for (var i = 0; i < 50; i++)
+        {
+            await cache.WithRefreshLockAsync($"user:{i}", _ => Task.FromResult(i), TestContext.Current.CancellationToken);
+        }
+
+        cache.RefreshLockCount.ShouldBe(0);
+    }
+
+    [Fact]
     public async Task GetAsync_NoStoredValue_ReturnsNull()
     {
         var (cache, distributedCache) = CreateCache();

@@ -2,7 +2,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SyntaxCircus.Blazor.Auth;
 
-/// <summary>Publishes user-scoped token-expiry events to active Blazor circuits.</summary>
+/// <summary>Publishes token-expiry events, by cache key, to active Blazor circuits.</summary>
 public sealed class SessionExpiryBroker : ISessionExpirySubscriptionSource
 {
     private readonly object gate = new();
@@ -22,7 +22,7 @@ public sealed class SessionExpiryBroker : ISessionExpirySubscriptionSource
         this.logger = logger;
     }
 
-    /// <summary>Subscribes an active circuit to expiry events for one user cache key.</summary>
+    /// <summary>Subscribes an active circuit to expiry events for one cache key.</summary>
     public IDisposable Subscribe(string cacheKey, Action callback)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(cacheKey);
@@ -44,7 +44,7 @@ public sealed class SessionExpiryBroker : ISessionExpirySubscriptionSource
         return new Subscription(this, cacheKey, id);
     }
 
-    /// <summary>Publishes expiry to active circuits for the specified user only.</summary>
+    /// <summary>Publishes expiry to active circuits observing this cache key only.</summary>
     public void Publish(string cacheKey)
     {
         if (string.IsNullOrWhiteSpace(cacheKey))
